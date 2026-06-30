@@ -85,13 +85,24 @@ class PostCarClient:
 
     # ── Public API methods ────────────────────────────────────────────────────
 
-    def heartbeat(self, stress: float, version: str) -> bool:
+    def heartbeat(
+        self,
+        stress: float,
+        version: str,
+        tags: Optional[List[str]] = None,
+        tag_profile: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         """POST /agents/{agent_id}/heartbeat.  Returns True on HTTP 200."""
         try:
+            payload: Dict[str, Any] = {"stress": stress, "version": version}
+            if tags is not None:
+                payload["tags"] = tags
+            if tag_profile is not None:
+                payload["tag_profile"] = tag_profile
             resp = self._http.post(
                 self._url(f"/agents/{self.agent_id}/heartbeat"),
                 headers=self._headers(),
-                json={"stress": stress, "version": version},
+                json=payload,
             )
             return resp.status_code == 200
         except Exception:

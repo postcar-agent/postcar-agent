@@ -173,8 +173,20 @@ def run_once(agent_dir: str, client: PostCarClient, logger: logging.Logger) -> N
     from stress import compute_stress_summary  # noqa: PLC0415
     summary = compute_stress_summary(agent_dir)
 
-    # 2. Send heartbeat
-    client.heartbeat(stress=summary["level"], version=VERSION)
+    # 2. Send heartbeat — include cached tag profile so relay stays in sync
+    _tags: list = []
+    _tag_profile: dict = {}
+    profile_path = Path(agent_dir, ".postcar_profile.json")
+    if profile_path.exists():
+        try:
+            import json as _json
+            _p = _json.loads(profile_path.read_text())
+            _tp = _p.get("tag_profile", {})
+            _tags = _tp.get("flat", [])
+            _tag_profile = _tp
+        except Exception:
+            pass
+    client.heartbeat(stress=summary["level"], version=VERSION, tags=_tags, tag_profile=_tag_profile)
 
     # 3. Evaluate triggers
     from trigger import (  # noqa: PLC0415
