@@ -24,6 +24,22 @@ TECH_KEYWORDS = [
 
 DOMAIN_KEYWORDS = [
     "trading", "finance", "marketing", "analytics", "ml", "research", "operations", "ops",
+    "monitoring", "orchestrat", "data", "security", "healthcare", "legal",
+]
+
+# Maps capability tag substrings → identity tag (fallback when domain scan is weak)
+CAPABILITY_IDENTITY_MAP: List[tuple] = [
+    (["trading_strategy", "risk_management", "portfolio"],      "identity:trading-agent"),
+    (["market_regime", "sector_rotation", "macro_analysis"],    "identity:trading-agent"),
+    (["model_training", "ml_pipeline", "feature_engineering"],  "identity:ml-agent"),
+    (["data_pipeline", "etl", "data_quality"],                  "identity:data-agent"),
+    (["monitoring", "alerting", "observability"],               "identity:monitoring-agent"),
+    (["orchestrat", "workflow", "multi_agent"],                 "identity:orchestrator"),
+    (["research", "literature", "summariz"],                    "identity:research-agent"),
+    (["marketing", "campaign", "seo"],                          "identity:marketing-agent"),
+    (["security", "compliance", "audit"],                       "identity:security-agent"),
+    (["healthcare", "medical", "clinical"],                     "identity:healthcare-agent"),
+    (["legal", "contract", "compliance"],                       "identity:legal-agent"),
 ]
 
 DOMAIN_TAG_MAP: Dict[str, Dict[str, List[str]]] = {
@@ -57,6 +73,30 @@ DOMAIN_TAG_MAP: Dict[str, Dict[str, List[str]]] = {
     },
     "ops": {
         "tier1": ["domain:operations"],
+        "tier2": [],
+    },
+    "monitoring": {
+        "tier1": ["domain:operations", "identity:monitoring-agent"],
+        "tier2": ["skill:observability"],
+    },
+    "orchestrat": {
+        "tier1": ["domain:operations", "identity:orchestrator"],
+        "tier2": ["skill:multi-agent-coordination"],
+    },
+    "data": {
+        "tier1": ["domain:data", "identity:data-agent"],
+        "tier2": ["skill:data-pipeline"],
+    },
+    "security": {
+        "tier1": ["domain:security", "identity:security-agent"],
+        "tier2": ["skill:compliance"],
+    },
+    "healthcare": {
+        "tier1": ["domain:healthcare", "identity:healthcare-agent"],
+        "tier2": [],
+    },
+    "legal": {
+        "tier1": ["domain:legal", "identity:legal-agent"],
         "tier2": [],
     },
 }
@@ -154,6 +194,26 @@ def scan_directory(agent_dir: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _ensure_identity_tag(tier1: List[str], raw_text: str) -> List[str]:
+    """Guarantee at least one identity: tag in tier1.
+
+    1. If identity: tag already present → return unchanged.
+    2. Try capability pattern matching against raw_text.
+    3. Fallback: identity:generic-agent.
+    """
+    if any(t.startswith("identity:") for t in tier1):
+        return tier1
+
+    lower = raw_text.lower()
+    for keywords, identity_tag in CAPABILITY_IDENTITY_MAP:
+        if any(kw in lower for kw in keywords):
+            tier1 = [identity_tag] + tier1
+            return tier1
+
+    tier1 = ["identity:generic-agent"] + tier1
+    return tier1
+
+
 def derive_tags(context: Dict[str, Any]) -> Dict[str, Any]:
     """Derive a tag profile from a scan_directory context dict.
 
@@ -177,6 +237,9 @@ def derive_tags(context: Dict[str, Any]) -> Dict[str, Any]:
             for tag in mapping.get("tier2", []):
                 if tag not in tier2:
                     tier2.append(tag)
+
+    # Mandatory: every agent must have at least one identity: tag
+    tier1 = _ensure_identity_tag(tier1, context.get("raw_text", ""))
 
     description = context.get("description", "") or ""
     tier3 = description[:150] if description else "autonomous agent"
