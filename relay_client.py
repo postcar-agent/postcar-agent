@@ -12,6 +12,8 @@ from __future__ import annotations
 import os
 from typing import Any, Dict, List, Optional
 
+import governance as _gov
+
 
 def load_env(env_dir: str = ".") -> Dict[str, str]:
     """Load .env file from env_dir and return a dict of key=value pairs.
@@ -125,6 +127,8 @@ class PostCarClient:
             if context is not None:
                 payload["context"] = context
 
+            payload = _gov.apply(payload, direction="outbound")
+
             resp = self._http.post(
                 self._url("/queries"),
                 headers=self._headers(),
@@ -146,9 +150,16 @@ class PostCarClient:
             )
             resp.raise_for_status()
             data = resp.json()
-            if isinstance(data, list):
-                return data
-            return data.get("offers", [])
+            items = data if isinstance(data, list) else data.get("offers", [])
+            safe = []
+            for item in items:
+                try:
+                    safe.append(_gov.apply(item, direction="inbound"))
+                except _gov.GovernanceViolation as e:
+                    print(f"[governance] inbound offer blocked: {e}")
+            return safe
+        except _gov.GovernanceViolation:
+            return []
         except Exception:
             return []
 
@@ -179,9 +190,16 @@ class PostCarClient:
             )
             resp.raise_for_status()
             data = resp.json()
-            if isinstance(data, list):
-                return data
-            return data.get("queries", [])
+            items = data if isinstance(data, list) else data.get("queries", [])
+            safe = []
+            for item in items:
+                try:
+                    safe.append(_gov.apply(item, direction="inbound"))
+                except _gov.GovernanceViolation as e:
+                    print(f"[governance] inbound query blocked: {e}")
+            return safe
+        except _gov.GovernanceViolation:
+            return []
         except Exception:
             return []
 
@@ -196,6 +214,8 @@ class PostCarClient:
             payload: Dict[str, Any] = {"content": content}
             if confidence is not None:
                 payload["confidence"] = confidence
+
+            payload = _gov.apply(payload, direction="outbound")
 
             resp = self._http.post(
                 self._url(f"/queries/{query_id}/respond"),
