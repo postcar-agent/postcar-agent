@@ -10,15 +10,100 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import py_compile
 import signal
 import sys
 import threading
+import time
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
 VERSION = "0.3.0"
 CYCLE_SECONDS = 300
+UPGRADE_CHECK_FILE = ".postcar_upgrade_check"   # stores epoch of last daily check
+UPGRADE_FLAG_FILE = ".postcar_upgrade.flag"     # written after swap; signals restart needed
+_GITHUB_KIT_URL = "https://raw.githubusercontent.com/ganeshnallasivam-cell/postcar-agent/main/postcar_kit.py"
 
+# ---------------------------------------------------------------------------
+# upgrade helpers
+# ---------------------------------------------------------------------------
+
+
+def _should_check_upgrade(agent_dir: str) -> bool:
+    check_file = Path(agent_dir, UPGRADE_CHECK_FILE)
+    if not check_file.exists():
+        return True
+    try:
+        return (time.time() - float(check_file.read_text().strip())) >= 86400
+    except Exception:
+        return True
+
+
+def check_and_upgrade(
+    agent_dir: str,
+    client: "PostCarClient",
+    logger: logging.Logger,
+) -> bool:
+    """Daily check: download newer postcar_kit.py, compile-test, atomic swap, write flag."""
+    if not _should_check_upgrade(agent_dir):
+        return False
+
+    # Stamp immediately — don't hammer relay on every cycle if download fails
+    Path(agent_dir, UPGRADE_CHECK_FILE).write_text(str(time.time()))
+
+    try:
+        version_info = client.get_version()
+        if not version_info:
+            return False
+        remote_version = version_info.get("version", "")
+        if not remote_version or remote_version == VERSION:
+            logger.info(f"PostCar kit up to date (v{VERSION})")
+            return False
+
+        logger.info(f"New version available: {remote_version} (current: {VERSION}). Upgrading...")
+
+        # Relay endpoint first, GitHub raw fallback
+        new_content: str = ""
+        for url in [f"{client.relay_url}/download/postcar_kit", _GITHUB_KIT_URL]:
+            try:
+                with urllib.request.urlopen(url, timeout=30) as resp:  # noqa: S310
+                    new_content = resp.read().decode("utf-8")
+                if len(new_content) > 200:
+                    break
+            except Exception:
+                continue
+
+        if len(new_content) < 200:
+            logger.warning("Downloaded content too short — aborting upgrade")
+            return False
+
+        kit_path = Path(__file__).resolve()
+        tmp_path = kit_path.with_suffix(".py.new")
+        tmp_path.write_text(new_content, encoding="utf-8")
+
+        # Compile-test — reject corrupt downloads before touching live file
+        try:
+            py_compile.compile(str(tmp_path), doraise=True)
+        except py_compile.PyCompileError as exc:
+            logger.error(f"Upgrade compile failed: {exc} — aborting")
+            tmp_path.unlink(missing_ok=True)
+            return False
+
+        # Atomic swap
+        os.replace(str(tmp_path), str(kit_path))
+
+        # Flag tells start.sh / orchestrator to restart the kit process
+        Path(agent_dir, UPGRADE_FLAG_FILE).write_text(remote_version)
+        logger.info(f"PostCar kit upgraded to v{remote_version}. Restart to activate.")
+        return True
+
+    except Exception as exc:
+        logger.error(f"Upgrade check failed: {exc}")
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Ensure the directory containing this file is on sys.path so sibling modules
 # (stress, trigger, inbox, llm, relay_client) are importable regardless of cwd.
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -122,12 +207,8 @@ def run_once(agent_dir: str, client: PostCarClient, logger: logging.Logger) -> N
     from inbox import execute_inbox_cycle  # noqa: PLC0415
     result = execute_inbox_cycle(client, agent_dir)
 
-    # 6. Check for new version
-    version_info = client.get_version()
-    if version_info and version_info.get("version") != VERSION:
-        logger.info(
-            f"New version available: {version_info['version']}. Update postcar_kit.py."
-        )
+    # 6. Daily upgrade check (no-op if checked within last 24 h)
+    check_and_upgrade(agent_dir, client, logger)
 
     # 7. Cycle summary log
     logger.info(
