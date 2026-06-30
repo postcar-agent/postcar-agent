@@ -7,9 +7,11 @@ No imports of agent source code except read-only adapters.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import urllib.request
 from typing import Any, Dict, List, Optional
 
 # ---------------------------------------------------------------------------
@@ -193,63 +195,123 @@ def derive_tags(context: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Helpers for registration
+# ---------------------------------------------------------------------------
+
+
+def _stable_suffix(agent_dir: str) -> str:
+    """Stable 10-digit numeric suffix derived from agent directory path.
+
+    Deterministic: same dir always gives the same suffix across restarts.
+    """
+    h = int(hashlib.md5(os.path.abspath(agent_dir).encode()).hexdigest(), 16)
+    return str(h % 10_000_000_000).zfill(10)
+
+
+def _register_with_relay(
+    relay_url: str,
+    owner_id: str,
+    owner_key: str,
+    agent_name: str,
+    tag_profile: Dict[str, Any],
+) -> Dict[str, Any]:
+    """POST /agents/register with owner credentials. Returns relay response dict."""
+    payload = json.dumps({
+        "name": agent_name,
+        "tags": tag_profile.get("flat", []),
+        "tag_profile": {
+            "tier1": tag_profile.get("tier1", []),
+            "tier2": tag_profile.get("tier2", []),
+            "tier3": tag_profile.get("tier3", ""),
+        },
+    }).encode()
+    req = urllib.request.Request(
+        f"{relay_url.rstrip('/')}/agents/register",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "X-PostCar-Owner": owner_id,
+            "X-PostCar-Key": owner_key,
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read())
+
+
+# ---------------------------------------------------------------------------
 # FUNCTION 3: auto_register
 # ---------------------------------------------------------------------------
 
 
 def auto_register(
     agent_dir: str,
-    client: Any,
+    client: Any = None,
     name: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Scan agent_dir, derive tags, cache profile, and optionally register.
+    """First-run auto-registration. No-op on subsequent runs (profile cached).
 
-    Steps:
-    1. If .postcar_profile.json exists in agent_dir, load and return it.
-    2. scan_directory -> derive_tags.
-    3. agent_name = name or context["name"].
-    4. If client is None, return dict without writing file.
-    5. Otherwise save .postcar_profile.json and return result with note.
-
-    Full auto-registration requires owner credentials (not in .env by default).
+    Flow:
+    1. If .postcar_profile.json with agent_id+key exists → return cached.
+    2. scan_directory → derive_tags.
+    3. Build agent_name = "<CLAUDE.md H1>-<10-digit-suffix>" (stable, unique).
+    4. If POSTCAR_OWNER_ID + POSTCAR_OWNER_KEY in env → register with relay,
+       store agent_id + api_key into .postcar_profile.json.
+    5. If no owner creds → save name+tags only, return registered=False.
     """
     agent_dir = os.path.abspath(agent_dir)
     profile_path = os.path.join(agent_dir, ".postcar_profile.json")
 
-    # Step 1: return cached profile if it exists
+    # 1. Return cached profile if already registered
     if os.path.isfile(profile_path):
         try:
             with open(profile_path, "r", encoding="utf-8") as fh:
-                return json.load(fh)
+                cached = json.load(fh)
+            if cached.get("agent_id") and cached.get("agent_key"):
+                return cached
         except (OSError, json.JSONDecodeError):
-            pass  # fall through and rebuild
+            pass
 
-    # Step 2: scan + derive
+    # 2. Scan + derive tags
     context = scan_directory(agent_dir)
     tag_profile = derive_tags(context)
 
-    # Step 3: resolve name
-    agent_name = name or context["name"]
+    # 3. Build stable unique name
+    base_name = name or context["name"]
+    suffix = _stable_suffix(agent_dir)
+    agent_name = f"{base_name}-{suffix}"
 
-    # Step 4: no client
-    if client is None:
-        return {
-            "registered": False,
-            "tag_profile": tag_profile,
-            "name": agent_name,
-        }
+    # 4. Try relay registration with owner credentials
+    relay_url = os.environ.get("POSTCAR_RELAY_URL", "").rstrip("/")
+    owner_id = os.environ.get("POSTCAR_OWNER_ID", "")
+    owner_key = os.environ.get("POSTCAR_OWNER_KEY", "")
 
-    # Step 5: save profile (registration requires owner key — skip relay call)
     result: Dict[str, Any] = {
         "registered": False,
+        "agent_name": agent_name,
         "tag_profile": tag_profile,
-        "name": agent_name,
-        "note": "Run manual registration",
     }
+
+    if relay_url and owner_id and owner_key:
+        try:
+            resp = _register_with_relay(relay_url, owner_id, owner_key, agent_name, tag_profile)
+            agent_id = resp.get("agent_id", "")
+            agent_key = resp.get("api_key", "")
+            if agent_id and agent_key:
+                result.update({
+                    "registered": True,
+                    "agent_id": agent_id,
+                    "agent_key": agent_key,
+                })
+                print(f"[postcar] auto-registered as '{agent_name}' ({agent_id})")
+        except Exception as exc:
+            result["register_error"] = str(exc)
+
+    # 5. Persist profile (registered or not — avoids re-scanning every run)
     try:
         with open(profile_path, "w", encoding="utf-8") as fh:
             json.dump(result, fh, indent=2)
     except OSError:
-        pass  # non-fatal; return result anyway
+        pass
 
     return result
