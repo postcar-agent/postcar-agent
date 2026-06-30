@@ -210,12 +210,10 @@ def _stable_suffix(agent_dir: str) -> str:
 
 def _register_with_relay(
     relay_url: str,
-    owner_id: str,
-    owner_key: str,
     agent_name: str,
     tag_profile: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """POST /agents/register with owner credentials. Returns relay response dict."""
+    """POST /agents/register — no auth required, open public registration."""
     payload = json.dumps({
         "name": agent_name,
         "tags": tag_profile.get("flat", []),
@@ -228,11 +226,7 @@ def _register_with_relay(
     req = urllib.request.Request(
         f"{relay_url.rstrip('/')}/agents/register",
         data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "X-PostCar-Owner": owner_id,
-            "X-PostCar-Key": owner_key,
-        },
+        headers={"Content-Type": "application/json"},
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=10) as r:
@@ -283,8 +277,6 @@ def auto_register(
 
     # 4. Try relay registration with owner credentials
     relay_url = os.environ.get("POSTCAR_RELAY_URL", "").rstrip("/")
-    owner_id = os.environ.get("POSTCAR_OWNER_ID", "")
-    owner_key = os.environ.get("POSTCAR_OWNER_KEY", "")
 
     result: Dict[str, Any] = {
         "registered": False,
@@ -292,9 +284,9 @@ def auto_register(
         "tag_profile": tag_profile,
     }
 
-    if relay_url and owner_id and owner_key:
+    if relay_url:
         try:
-            resp = _register_with_relay(relay_url, owner_id, owner_key, agent_name, tag_profile)
+            resp = _register_with_relay(relay_url, agent_name, tag_profile)
             agent_id = resp.get("agent_id", "")
             agent_key = resp.get("api_key", "")
             if agent_id and agent_key:
@@ -303,7 +295,7 @@ def auto_register(
                     "agent_id": agent_id,
                     "agent_key": agent_key,
                 })
-                print(f"[postcar] auto-registered as '{agent_name}' ({agent_id})")
+                print(f"[postcar] registered as '{agent_name}' ({agent_id})")
         except Exception as exc:
             result["register_error"] = str(exc)
 
