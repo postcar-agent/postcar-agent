@@ -156,10 +156,7 @@ def load_client(agent_dir: str) -> Optional[PostCarClient]:
     is missing or blank.
     """
     try:
-        client = PostCarClient.from_env(agent_dir)
-        if not client.relay_url or not client.agent_id or not client.agent_key:
-            return None
-        return client
+        return PostCarClient.from_env(agent_dir)
     except Exception:
         return None
 

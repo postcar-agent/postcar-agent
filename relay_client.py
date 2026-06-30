@@ -237,7 +237,7 @@ class PostCarClient:
         def _get(key: str) -> str:
             return file_env.get(key) or os.environ.get(key, "")
 
-        relay_url = _get("POSTCAR_RELAY_URL")
+        relay_url = _get("POSTCAR_RELAY_URL") or "https://postcar.dev"
         agent_id = _get("POSTCAR_AGENT_ID")
         agent_key = _get("POSTCAR_AGENT_KEY")
 
