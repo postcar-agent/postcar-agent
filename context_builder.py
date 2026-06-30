@@ -106,6 +106,61 @@ DOMAIN_TAG_MAP: Dict[str, Dict[str, List[str]]] = {
 # ---------------------------------------------------------------------------
 
 
+def extract_goals(agent_dir: str) -> str:
+    """Extract goals/objectives/role section from CLAUDE.md or README.md.
+
+    Looks for markdown sections headed with any of:
+      Goals, Objectives, Mission, Role, Purpose, Responsibilities
+    Returns the section body (up to 800 chars). Falls back to first paragraph.
+    """
+    goal_headings = re.compile(
+        r"^#{1,3}\s*(goals?|objectives?|mission|role|purpose|responsibilities)",
+        re.IGNORECASE,
+    )
+    agent_dir = os.path.abspath(agent_dir)
+    for filename in ("CLAUDE.md", "README.md"):
+        filepath = os.path.join(agent_dir, filename)
+        if not os.path.isfile(filepath):
+            continue
+        try:
+            with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
+                lines = fh.readlines()
+        except OSError:
+            continue
+
+        in_section = False
+        collected: List[str] = []
+        for line in lines:
+            if goal_headings.match(line):
+                in_section = True
+                continue
+            if in_section:
+                # Stop at next heading of same or higher level
+                if re.match(r"^#{1,3}\s+", line) and not goal_headings.match(line):
+                    break
+                collected.append(line)
+
+        if collected:
+            return "".join(collected).strip()[:800]
+
+    # Fallback: first non-heading paragraph from CLAUDE.md
+    for filename in ("CLAUDE.md", "README.md"):
+        filepath = os.path.join(agent_dir, filename)
+        if not os.path.isfile(filepath):
+            continue
+        try:
+            with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
+                content = fh.read()
+        except OSError:
+            continue
+        for line in content.splitlines():
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                return stripped[:400]
+
+    return ""
+
+
 def scan_directory(agent_dir: str) -> Dict[str, Any]:
     """Scan agent_dir for markdown files and extract structured context.
 

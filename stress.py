@@ -15,6 +15,7 @@ Identity-specific stress templates derived from agent's registered identity tag.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -333,6 +334,121 @@ def get_template(identity: str) -> Dict[str, Any]:
     return STRESS_TEMPLATES.get(identity, STRESS_TEMPLATES["identity:generic-agent"])
 
 
+# ── Dynamic question generation from CLAUDE.md goals ────────────────────────
+
+_QUESTIONS_CACHE_FILE = ".postcar_stress_questions.json"
+
+_SYSTEM_PROMPT = (
+    "You generate stress self-assessment questions for autonomous AI agents. "
+    "Questions must be answerable YES/NO by the agent through its own telemetry and logs. "
+    "Each question targets a specific failure mode the agent could detect in itself. "
+    "Return ONLY a JSON array of strings — no explanation, no markdown, no preamble."
+)
+
+_QUESTION_PROMPT = """
+An autonomous AI agent has these goals and responsibilities:
+
+{goals}
+
+Its identity type is: {identity}
+
+Generate exactly 8 yes/no stress self-assessment questions this specific agent should ask
+itself each cycle to determine if it is operating correctly relative to its goals.
+Questions must be:
+- Specific to this agent's actual mission (not generic)
+- Answerable from the agent's own logs, metrics, or outputs
+- Phrased as "Is [something bad happening]?" or "Have I [missed/failed/degraded]?"
+- Covering: output quality, goal progress, dependency health, error patterns, resource state
+
+Return ONLY a JSON array of 8 strings. Example format:
+["Question 1?", "Question 2?", ...]
+""".strip()
+
+
+def _goals_hash(goals: str) -> str:
+    return hashlib.md5(goals.encode()).hexdigest()[:12]
+
+
+def load_dynamic_questions(agent_dir: str) -> Optional[Dict[str, Any]]:
+    """Load cached dynamic questions if they exist and goals haven't changed."""
+    path = os.path.join(agent_dir, _QUESTIONS_CACHE_FILE)
+    try:
+        with open(path, "r") as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
+def save_dynamic_questions(agent_dir: str, data: Dict[str, Any]) -> None:
+    path = os.path.join(agent_dir, _QUESTIONS_CACHE_FILE)
+    try:
+        with open(path, "w") as fh:
+            json.dump(data, fh, indent=2)
+    except Exception:
+        pass
+
+
+def generate_questions_from_goals(agent_dir: str, identity: str) -> List[str]:
+    """
+    Generate agent-specific stress questions from its CLAUDE.md goals.
+
+    - Reads goals via context_builder.extract_goals()
+    - Hash-gated: only calls LLM when goals change (or cache missing)
+    - Falls back to identity template questions if LLM unavailable or fails
+    """
+    # Import here to avoid circular dependency at module load
+    try:
+        from context_builder import extract_goals
+    except ImportError:
+        return get_template(identity)["self_assessment"]
+
+    goals = extract_goals(agent_dir)
+    if not goals:
+        return get_template(identity)["self_assessment"]
+
+    goals_hash = _goals_hash(goals)
+
+    # Check cache
+    cached = load_dynamic_questions(agent_dir)
+    if cached and cached.get("goals_hash") == goals_hash:
+        return cached.get("questions", get_template(identity)["self_assessment"])
+
+    # Call LLM
+    try:
+        from llm import call_llm
+    except ImportError:
+        return get_template(identity)["self_assessment"]
+
+    prompt = _QUESTION_PROMPT.format(goals=goals, identity=identity)
+    raw = call_llm(prompt, system=_SYSTEM_PROMPT)
+
+    if not raw:
+        return get_template(identity)["self_assessment"]
+
+    # Parse JSON array from response
+    try:
+        # Strip markdown fences if present
+        clean = raw.strip()
+        if clean.startswith("```"):
+            clean = clean.split("```")[1]
+            if clean.startswith("json"):
+                clean = clean[4:]
+        questions = json.loads(clean.strip())
+        if isinstance(questions, list) and len(questions) >= 3:
+            save_dynamic_questions(agent_dir, {
+                "goals_hash": goals_hash,
+                "identity": identity,
+                "questions": questions,
+                "generated_from_goals": True,
+            })
+            print(f"[postcar:stress] generated {len(questions)} custom questions from CLAUDE.md goals")
+            return questions
+    except Exception:
+        pass
+
+    return get_template(identity)["self_assessment"]
+
+
 # ── Lifecycle state persistence ──────────────────────────────────────────────
 
 def _lifecycle_path(agent_dir: str) -> str:
@@ -381,6 +497,8 @@ def tick(agent_dir: str, client: Any = None) -> Dict[str, Any]:
     identity  = resolve_identity(agent_dir)
     template  = get_template(identity)
     lc        = load_lifecycle(agent_dir)
+    # Use dynamic questions if LLM available, else fall back to template
+    self_assessment_questions = generate_questions_from_goals(agent_dir, identity)
     now       = time.time()
 
     prev_state = lc.get("state", NOMINAL)
@@ -468,7 +586,7 @@ def tick(agent_dir: str, client: Any = None) -> Dict[str, Any]:
         "indicators": state,
         "high_cycles": lc.get("high_cycles", 0),
         "query_id": lc.get("query_id"),
-        "self_assessment_questions": template["self_assessment"],
+        "self_assessment_questions": self_assessment_questions,
         "recovery_signals": template["recovery_signals"],
     }
 
