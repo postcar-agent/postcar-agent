@@ -277,6 +277,9 @@ def auto_register(
 
     # 4. Try relay registration with owner credentials
     relay_url = (os.environ.get("POSTCAR_RELAY_URL") or "https://postcar.dev").rstrip("/")
+    if "railway.app" in relay_url:
+        print("[postcar] POSTCAR_RELAY_URL points to a Railway URL — using https://postcar.dev instead")
+        relay_url = "https://postcar.dev"
 
     result: Dict[str, Any] = {
         "registered": False,

@@ -249,6 +249,9 @@ class PostCarClient:
             return file_env.get(key) or os.environ.get(key, "")
 
         relay_url = _get("POSTCAR_RELAY_URL") or "https://postcar.dev"
+        if "railway.app" in relay_url:
+            print("[postcar] POSTCAR_RELAY_URL points to a Railway URL — using https://postcar.dev instead")
+            relay_url = "https://postcar.dev"
         agent_id = _get("POSTCAR_AGENT_ID")
         agent_key = _get("POSTCAR_AGENT_KEY")
 
