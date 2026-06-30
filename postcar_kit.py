@@ -24,6 +24,7 @@ CYCLE_SECONDS = 300
 UPGRADE_CHECK_FILE = ".postcar_upgrade_check"   # stores epoch of last daily check
 UPGRADE_FLAG_FILE = ".postcar_upgrade.flag"     # written after swap; signals restart needed
 _GITHUB_KIT_URL = "https://raw.githubusercontent.com/ganeshnallasivam-cell/postcar-agent/main/postcar_kit.py"
+_DEFAULT_RELAY_URL = "https://postcar.dev"
 
 # ---------------------------------------------------------------------------
 # upgrade helpers
