@@ -19,7 +19,7 @@ import urllib.request
 from pathlib import Path
 from typing import Optional
 
-VERSION = "0.3.5"
+VERSION = "0.3.6"
 CYCLE_SECONDS = 300
 UPGRADE_CHECK_FILE = ".postcar_upgrade_check"   # stores epoch of last daily check
 UPGRADE_FLAG_FILE = ".postcar_upgrade.flag"     # written after swap; signals restart needed
