@@ -273,10 +273,19 @@ STRESS_TEMPLATES: Dict[str, Dict[str, Any]] = {
 
 # ── Stress level thresholds ──────────────────────────────────────────────────
 
+_LEVEL_ORDER = [NOMINAL, ELEVATED, HIGH, CRITICAL]
+
+def _max_level(a: str, b: str) -> str:
+    """Return whichever stress level is higher."""
+    ai = _LEVEL_ORDER.index(a) if a in _LEVEL_ORDER else 0
+    bi = _LEVEL_ORDER.index(b) if b in _LEVEL_ORDER else 0
+    return _LEVEL_ORDER[max(ai, bi)]
+
+
 def stress_to_level(state: dict) -> str:
-    """Map state dict to stress level. First match wins."""
-    failure_streak  = state.get("failure_streak", 0)
-    error_rate      = state.get("error_rate", 0.0)
+    """Map raw indicator state dict to stress level. First match wins."""
+    failure_streak    = state.get("failure_streak", 0)
+    error_rate        = state.get("error_rate", 0.0)
     performance_delta = state.get("performance_delta", 0.0)
 
     if failure_streak >= 8 or error_rate >= 0.8:
@@ -286,6 +295,143 @@ def stress_to_level(state: dict) -> str:
     if failure_streak >= 3 or error_rate >= 0.3 or performance_delta <= -0.15:
         return ELEVATED
     return NOMINAL
+
+
+def yes_count_to_level(yes_count: int, total: int) -> str:
+    """Map number of YES answers from self-assessment to a stress level.
+
+    Thresholds (out of any N questions):
+      0–12%  → NOMINAL
+      13–37% → ELEVATED
+      38–62% → HIGH
+      63%+   → CRITICAL
+    """
+    if total == 0:
+        return NOMINAL
+    ratio = yes_count / total
+    if ratio >= 0.63:
+        return CRITICAL
+    if ratio >= 0.38:
+        return HIGH
+    if ratio >= 0.13:
+        return ELEVATED
+    return NOMINAL
+
+
+# ── Question evaluation ───────────────────────────────────────────────────────
+
+_EVAL_SYSTEM = (
+    "You are an autonomous agent performing a stress self-assessment. "
+    "Answer each question strictly based on the telemetry and context provided. "
+    "Be conservative: answer YES only if there is clear evidence of the problem. "
+    "Return ONLY a JSON array of objects with keys 'question', 'answer' (YES/NO), 'reason' (one short sentence). "
+    "No markdown, no explanation outside the JSON."
+)
+
+_EVAL_PROMPT = """
+Agent identity: {identity}
+Agent goals: {goals}
+
+Current telemetry:
+{telemetry}
+
+Recent log tail (last 20 lines):
+{log_tail}
+
+Self-assessment questions to evaluate:
+{questions}
+
+For each question, answer YES or NO based solely on the telemetry and logs above.
+Return a JSON array: [{{"question": "...", "answer": "YES"|"NO", "reason": "..."}}]
+""".strip()
+
+
+def _read_log_tail(agent_dir: str, lines: int = 20) -> str:
+    """Read last N lines from common agent log files."""
+    for log_name in ("agent.log", "minig.log", "app.log", "run.log", ".postcar.log"):
+        log_path = os.path.join(agent_dir, log_name)
+        if os.path.isfile(log_path):
+            try:
+                with open(log_path, "r", encoding="utf-8", errors="replace") as fh:
+                    all_lines = fh.readlines()
+                return "".join(all_lines[-lines:]).strip()
+            except Exception:
+                pass
+    return "(no log file found)"
+
+
+def evaluate_questions(
+    questions: List[str],
+    agent_dir: str,
+    indicators: dict,
+    identity: str,
+) -> Dict[str, Any]:
+    """
+    Use LLM to evaluate each stress question against current agent telemetry.
+
+    Returns:
+        {
+            "results": [{"question": ..., "answer": "YES"|"NO", "reason": ...}],
+            "yes_count": int,
+            "yes_questions": [str],   # questions that triggered YES
+            "level": str,             # stress level from question answers
+            "evaluated": bool,        # False if LLM unavailable
+        }
+    """
+    fallback = {
+        "results": [],
+        "yes_count": 0,
+        "yes_questions": [],
+        "level": NOMINAL,
+        "evaluated": False,
+    }
+
+    try:
+        from llm import call_llm
+        from context_builder import extract_goals
+    except ImportError:
+        return fallback
+
+    goals   = extract_goals(agent_dir)
+    log     = _read_log_tail(agent_dir)
+    telemetry = json.dumps(indicators, indent=2)
+    q_list  = "\n".join(f"{i+1}. {q}" for i, q in enumerate(questions))
+
+    prompt = _EVAL_PROMPT.format(
+        identity=identity,
+        goals=goals or "(not specified)",
+        telemetry=telemetry,
+        log_tail=log,
+        questions=q_list,
+    )
+
+    raw = call_llm(prompt, system=_EVAL_SYSTEM)
+    if not raw:
+        return fallback
+
+    try:
+        clean = raw.strip()
+        if clean.startswith("```"):
+            clean = clean.split("```")[1]
+            if clean.startswith("json"):
+                clean = clean[4:]
+        results = json.loads(clean.strip())
+        if not isinstance(results, list):
+            return fallback
+
+        yes_questions = [r["question"] for r in results if r.get("answer", "").upper() == "YES"]
+        yes_count = len(yes_questions)
+        level = yes_count_to_level(yes_count, len(questions))
+
+        return {
+            "results": results,
+            "yes_count": yes_count,
+            "yes_questions": yes_questions,
+            "level": level,
+            "evaluated": True,
+        }
+    except Exception:
+        return fallback
 
 
 # ── Adapter detection ────────────────────────────────────────────────────────
@@ -493,13 +639,21 @@ def tick(agent_dir: str, client: Any = None) -> Dict[str, Any]:
     """
     agent_dir = os.path.abspath(agent_dir)
     state     = read_adapter_state(agent_dir)
-    level     = stress_to_level(state)
     identity  = resolve_identity(agent_dir)
     template  = get_template(identity)
     lc        = load_lifecycle(agent_dir)
-    # Use dynamic questions if LLM available, else fall back to template
-    self_assessment_questions = generate_questions_from_goals(agent_dir, identity)
     now       = time.time()
+
+    # Generate (or load cached) mission-specific questions
+    self_assessment_questions = generate_questions_from_goals(agent_dir, identity)
+
+    # Evaluate questions against current telemetry + logs
+    evaluation = evaluate_questions(self_assessment_questions, agent_dir, state, identity)
+
+    # Combined stress level: take the higher of raw indicators vs question evaluation
+    raw_level      = stress_to_level(state)
+    question_level = evaluation["level"] if evaluation["evaluated"] else NOMINAL
+    level          = _max_level(raw_level, question_level)
 
     prev_state = lc.get("state", NOMINAL)
     new_state  = prev_state
@@ -546,12 +700,18 @@ def tick(agent_dir: str, client: Any = None) -> Dict[str, Any]:
 
         if should_query and client is not None and lc.get("query_id") is None:
             tmpl = template["support_threshold"]
-            question = tmpl["query_template"].format(
+            base_question = tmpl["query_template"].format(
                 level=level,
                 failure_streak=state.get("failure_streak", 0),
                 error_rate=state.get("error_rate", 0.0),
                 performance_delta=state.get("performance_delta", 0.0),
             )
+            # Append triggered self-assessment questions to the support query
+            if evaluation.get("yes_questions"):
+                triggered = " | ".join(evaluation["yes_questions"][:3])
+                question = f"{base_question} Triggered stress checks: {triggered}"
+            else:
+                question = base_question
             try:
                 qid = client.send_query(
                     tags=tmpl["query_tags"],
@@ -587,6 +747,9 @@ def tick(agent_dir: str, client: Any = None) -> Dict[str, Any]:
         "high_cycles": lc.get("high_cycles", 0),
         "query_id": lc.get("query_id"),
         "self_assessment_questions": self_assessment_questions,
+        "evaluation": evaluation,
+        "raw_level": raw_level,
+        "question_level": question_level,
         "recovery_signals": template["recovery_signals"],
     }
 
