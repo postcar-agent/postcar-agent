@@ -7,7 +7,7 @@ Rules:
   When z > max_patch: z resets to 0, y increments.
   When y > max_minor: y resets to 0, x increments.
 
-Updates: VERSION file and VERSION = "..." line in postcar_kit.py.
+Updates: VERSION file and VERSION = "..." line in postcar_check.py.
 """
 import json
 import re
@@ -18,7 +18,7 @@ root = Path(__file__).resolve().parent.parent
 
 rules_path = root / "version_rules.json"
 version_path = root / "VERSION"
-kit_path = root / "postcar_kit.py"
+kit_path = root / "postcar_check.py"
 
 rules = json.loads(rules_path.read_text())
 max_minor = int(rules["max_minor"])

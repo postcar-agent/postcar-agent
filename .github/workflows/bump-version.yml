@@ -5,7 +5,7 @@ on:
     branches: [main]
     paths-ignore:
       - VERSION
-      - postcar_kit.py
+      - postcar_check.py
 
 jobs:
   bump:
@@ -29,7 +29,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add VERSION postcar_kit.py
+          git add VERSION postcar_check.py
           git diff --cached --quiet || git commit -m "chore: bump version to $(cat VERSION)"
 
       - name: Push

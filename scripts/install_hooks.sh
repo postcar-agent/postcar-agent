@@ -15,7 +15,7 @@ cat > "$HOOK" << 'EOF'
 #!/bin/bash
 python3 "$(git rev-parse --show-toplevel)/scripts/bump_version.py"
 git add "$(git rev-parse --show-toplevel)/VERSION" \
-        "$(git rev-parse --show-toplevel)/postcar_kit.py"
+        "$(git rev-parse --show-toplevel)/postcar_check.py"
 EOF
 
 chmod +x "$HOOK"

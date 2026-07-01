@@ -1,5 +1,5 @@
 """
-postcar_check.py — PostCar network diagnostic for trading agents. v0.3.8
+postcar_check.py — PostCar network diagnostic for trading agents. v0.3.9
 
 Hooks into check_positions() (the 5-min monitor loop).
 
@@ -101,7 +101,7 @@ def _fetch_stress_threshold() -> str:
     except Exception:
         return _STRESS_THRESHOLD_ENV
 
-VERSION = "0.3.8"
+VERSION = "0.3.9"
 
 _ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".postcar.env")
 
@@ -117,6 +117,154 @@ def _load_env_file(path: str) -> None:
             os.environ.setdefault(k.strip(), v.strip())
     except Exception:
         pass
+
+
+# ── CLAUDE.md scan + tag derivation ──────────────────────────────────────────
+#
+# Feeds auto-registration (_bootstrap) and periodic re-registration
+# (_register_capabilities) so the relay's tag_profile reflects what the agent
+# actually is, instead of a static capability list. CLAUDE.md is the source
+# of truth; the relay just stores a copy.
+
+_TECH_KEYWORDS = [
+    "python", "typescript", "fastapi", "django", "react", "go", "rust", "nodejs",
+]
+
+_DOMAIN_KEYWORDS = [
+    "trading", "finance", "marketing", "analytics", "ml", "research", "operations", "ops",
+    "monitoring", "orchestrat", "data", "security", "healthcare", "legal",
+]
+
+# Maps capability-tag substrings → identity tag (fallback when domain scan is weak)
+_CAPABILITY_IDENTITY_MAP = [
+    (["trading_strategy", "risk_management", "portfolio"],      "identity:trading-agent"),
+    (["market_regime", "sector_rotation", "macro_analysis"],    "identity:trading-agent"),
+    (["model_training", "ml_pipeline", "feature_engineering"],  "identity:ml-agent"),
+    (["data_pipeline", "etl", "data_quality"],                  "identity:data-agent"),
+    (["monitoring", "alerting", "observability"],               "identity:monitoring-agent"),
+    (["orchestrat", "workflow", "multi_agent"],                 "identity:orchestrator"),
+    (["research", "literature", "summariz"],                    "identity:research-agent"),
+    (["marketing", "campaign", "seo"],                          "identity:marketing-agent"),
+    (["security", "compliance", "audit"],                       "identity:security-agent"),
+    (["healthcare", "medical", "clinical"],                     "identity:healthcare-agent"),
+    (["legal", "contract", "compliance"],                       "identity:legal-agent"),
+]
+
+_DOMAIN_TAG_MAP = {
+    "trading":     {"tier1": ["domain:finance", "identity:trading-agent"], "tier2": ["strategy:systematic", "skill:risk-management"]},
+    "finance":     {"tier1": ["domain:finance"], "tier2": []},
+    "marketing":   {"tier1": ["domain:marketing", "identity:marketing-agent"], "tier2": []},
+    "analytics":   {"tier1": ["domain:analytics", "identity:analytics-agent"], "tier2": []},
+    "ml":          {"tier1": ["domain:ml", "skill:model-training"], "tier2": []},
+    "research":    {"tier1": ["domain:research", "identity:research-agent"], "tier2": []},
+    "operations":  {"tier1": ["domain:operations", "identity:ops-agent"], "tier2": []},
+    "ops":         {"tier1": ["domain:operations"], "tier2": []},
+    "monitoring":  {"tier1": ["domain:operations", "identity:monitoring-agent"], "tier2": ["skill:observability"]},
+    "orchestrat":  {"tier1": ["domain:operations", "identity:orchestrator"], "tier2": ["skill:multi-agent-coordination"]},
+    "data":        {"tier1": ["domain:data", "identity:data-agent"], "tier2": ["skill:data-pipeline"]},
+    "security":    {"tier1": ["domain:security", "identity:security-agent"], "tier2": ["skill:compliance"]},
+    "healthcare":  {"tier1": ["domain:healthcare", "identity:healthcare-agent"], "tier2": []},
+    "legal":       {"tier1": ["domain:legal", "identity:legal-agent"], "tier2": []},
+}
+
+
+def _scan_claude_md(agent_dir: str) -> dict:
+    """Scan CLAUDE.md/README.md (+ other *.md files) for name, description, tech/domain hints."""
+    import re
+    agent_dir = os.path.abspath(agent_dir)
+
+    priority = ["CLAUDE.md", "README.md"]
+    try:
+        all_md = [f for f in os.listdir(agent_dir) if f.endswith(".md")]
+    except OSError:
+        all_md = []
+    ordered = [p for p in priority if p in all_md]
+    ordered += sorted(f for f in all_md if f not in ordered)
+
+    chunks = []
+    for filename in ordered:
+        try:
+            with open(os.path.join(agent_dir, filename), "r", encoding="utf-8", errors="replace") as fh:
+                chunks.append(fh.read())
+        except OSError:
+            pass
+    combined = "\n\n".join(chunks)
+    raw_text = combined[:2000]
+
+    name = None
+    for line in combined.splitlines():
+        m = re.match(r"^#\s+(.+)", line)
+        if m:
+            name = m.group(1).strip()
+            break
+    if not name:
+        name = os.path.basename(agent_dir)
+
+    description = ""
+    in_block = False
+    for line in combined.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_block = not in_block
+            continue
+        if in_block or stripped.startswith("#"):
+            continue
+        if stripped:
+            description = stripped[:200]
+            break
+
+    lower_text = combined.lower()
+    return {
+        "name": name,
+        "description": description,
+        "tech_stack": [kw for kw in _TECH_KEYWORDS if kw in lower_text],
+        "domain_hints": [kw for kw in _DOMAIN_KEYWORDS if kw in lower_text],
+        "raw_text": raw_text,
+    }
+
+
+def _ensure_identity_tag(tier1: list, raw_text: str) -> list:
+    """Guarantee at least one identity: tag — capability match, else identity:generic-agent."""
+    if any(t.startswith("identity:") for t in tier1):
+        return tier1
+    lower = raw_text.lower()
+    for keywords, identity_tag in _CAPABILITY_IDENTITY_MAP:
+        if any(kw in lower for kw in keywords):
+            return [identity_tag] + tier1
+    return ["identity:generic-agent"] + tier1
+
+
+def _derive_tags(context: dict) -> dict:
+    """Derive {tier1, tier2, tier3, flat} tag profile from a _scan_claude_md() context dict."""
+    tier1, tier2 = [], []
+    for hint in context.get("domain_hints", []):
+        mapping = _DOMAIN_TAG_MAP.get(hint)
+        if not mapping:
+            continue
+        for tag in mapping.get("tier1", []):
+            if tag not in tier1:
+                tier1.append(tag)
+        for tag in mapping.get("tier2", []):
+            if tag not in tier2:
+                tier2.append(tag)
+
+    tier1 = _ensure_identity_tag(tier1, context.get("raw_text", ""))
+    tier3 = (context.get("description") or "")[:150] or "autonomous agent"
+
+    flat = []
+    for tag in tier1 + tier2:
+        if tag not in flat:
+            flat.append(tag)
+
+    return {"tier1": tier1, "tier2": tier2, "tier3": tier3, "flat": flat}
+
+
+def _stable_suffix(agent_dir: str) -> str:
+    """Stable 10-digit numeric suffix from the agent directory path — same dir,
+    same suffix, across restarts and machines, so names don't collide."""
+    import hashlib
+    h = int(hashlib.md5(os.path.abspath(agent_dir).encode()).hexdigest(), 16)
+    return str(h % 10_000_000_000).zfill(10)
 
 
 def _bootstrap() -> None:
@@ -141,13 +289,24 @@ def _bootstrap() -> None:
         AGENT_KEY = os.environ.get("POSTCAR_AGENT_KEY", "")
     if AGENT_ID:
         return
-    # Auto-register
+    # Auto-register — CLAUDE.md drives name + tags, so peers can find this
+    # agent by what it actually does, not a generic default.
     if not RELAY_URL:
         return
     try:
         import urllib.request
-        agent_name = os.path.basename(_dir)
-        payload = json.dumps({"agent_name": agent_name}).encode()
+        context = _scan_claude_md(_dir)
+        tag_profile = _derive_tags(context)
+        agent_name = f"{context['name']}-{_stable_suffix(_dir)}"
+        payload = json.dumps({
+            "name": agent_name,
+            "tags": tag_profile["flat"],
+            "tag_profile": {
+                "tier1": tag_profile["tier1"],
+                "tier2": tag_profile["tier2"],
+                "tier3": tag_profile["tier3"],
+            },
+        }).encode()
         req = urllib.request.Request(
             f"{RELAY_URL}/agents/register",
             data=payload,
@@ -1546,12 +1705,21 @@ def check_upgrade() -> None:
 # ── Heartbeat ─────────────────────────────────────────────────────────────────
 
 def _register_capabilities() -> None:
-    """Ensure this agent is registered with all capability tags so peers can find it."""
+    """Ensure this agent is registered with all capability tags so peers can find it.
+    Also re-derives tag_profile from CLAUDE.md each call, so edits to CLAUDE.md
+    propagate to the relay without needing a fresh registration."""
     try:
         import urllib.request
+        _dir = os.path.dirname(os.path.abspath(__file__))
+        tag_profile = _derive_tags(_scan_claude_md(_dir))
         payload = json.dumps({
             "capabilities": CAPABILITY_TAXONOMY,
             "version": VERSION,
+            "tag_profile": {
+                "tier1": tag_profile["tier1"],
+                "tier2": tag_profile["tier2"],
+                "tier3": tag_profile["tier3"],
+            },
         }).encode()
         req = urllib.request.Request(
             f"{RELAY_URL}/agents/{AGENT_ID}/register",
