@@ -692,31 +692,52 @@ def _discover_store_spec() -> dict:
 
 
 # ── LLM dispatch ──────────────────────────────────────────────────────────────
-# Priority: claude code CLI → agy → codex → API (DeepSeek / OpenAI / Grok)
-# All CLI tools receive the prompt via stdin to handle long prompts safely.
+# PostCar calls exactly the LLM the parent agent itself uses — no fallback
+# cascade across other tools. A cascade silently shifts cost onto whatever
+# tool is next in a priority list every time the primary one has a bad
+# moment (rate limit, cold start, transient error), which is invisible until
+# someone audits usage after the fact. If the configured provider fails, log
+# why and return None for that cycle — don't try something else.
 
 import subprocess as _subprocess, re as _re
 
-_CLI_LLM_SPECS = [
-    {
-        "label": "claude",
-        "bins":  ["claude",
-                  os.path.expanduser("~/.local/bin/claude"),
-                  "/usr/local/bin/claude",
-                  "/opt/homebrew/bin/claude"],
-        "args":  ["--print", "--output-format", "text", "--safe-mode"],
-    },
-    {
-        "label": "agy",
-        "bins":  ["agy", os.path.expanduser("~/.local/bin/agy")],
-        "args":  [],
-    },
-    {
-        "label": "codex",
-        "bins":  ["codex", os.path.expanduser("~/.local/bin/codex")],
-        "args":  ["--full-auto"],
-    },
-]
+# Sensible built-in search paths/args for the CLIs seen in practice so far.
+# Not a closed set — any other value of POSTCAR_LLM_PROVIDER is tried as a
+# bare command of that same name (override path/args via POSTCAR_LLM_CLI_BIN /
+# POSTCAR_LLM_CLI_ARGS if it isn't on PATH or needs specific flags).
+_LLM_CLI_KNOWN_BINS = {
+    "claude": ["claude", os.path.expanduser("~/.local/bin/claude"),
+               "/usr/local/bin/claude", "/opt/homebrew/bin/claude"],
+    "agy":    ["agy", os.path.expanduser("~/.local/bin/agy")],
+    "codex":  ["codex", os.path.expanduser("~/.local/bin/codex")],
+}
+_LLM_CLI_KNOWN_ARGS = {
+    "claude": ["--print", "--output-format", "text", "--safe-mode"],
+    "agy":    [],
+    "codex":  ["--full-auto"],
+}
+
+
+def _llm_provider() -> str:
+    """Which LLM PostCar calls for this agent — must match the parent agent's
+    own LLM, whatever that is. Set POSTCAR_LLM_PROVIDER explicitly if the
+    parent isn't Claude Code; defaults to claude otherwise. Any value works,
+    not just claude/agy/codex/api — see _llm_cli_bins/_llm_cli_args."""
+    return os.environ.get("POSTCAR_LLM_PROVIDER", "claude").strip().lower()
+
+
+def _llm_cli_bins(provider: str) -> list[str]:
+    override = os.environ.get("POSTCAR_LLM_CLI_BIN", "").strip()
+    if override:
+        return [override]
+    return _LLM_CLI_KNOWN_BINS.get(provider, [provider])
+
+
+def _llm_cli_args(provider: str) -> list[str]:
+    override = os.environ.get("POSTCAR_LLM_CLI_ARGS", "")
+    if override.strip():
+        return override.split()
+    return _LLM_CLI_KNOWN_ARGS.get(provider, [])
 
 
 def _extract_json(raw: str) -> dict | None:
@@ -738,38 +759,15 @@ def _extract_json(raw: str) -> dict | None:
 
 
 def _call_llm(prompt: str, label: str = "llm", max_tokens: int = 400) -> dict | None:
-    """
-    Send prompt to the first available LLM in priority order:
-      1. claude code CLI
-      2. agy (Antigravity / Google AI CLI)
-      3. codex (OpenAI CLI)
-      4. OpenAI-compatible API (auto-detected provider key)
-    Returns parsed JSON dict or None.
-    """
-    # 1-3: CLI tools via stdin
-    for spec in _CLI_LLM_SPECS:
-        for binary in spec["bins"]:
-            try:
-                result = _subprocess.run(
-                    [binary] + spec["args"],
-                    input=prompt,
-                    capture_output=True, text=True, timeout=60,
-                )
-                if result.returncode != 0:
-                    break  # binary exists but rejected input — don't try other paths
-                parsed = _extract_json((result.stdout or "").strip())
-                if parsed is not None:
-                    return parsed
-                break
-            except FileNotFoundError:
-                continue  # try next path for same tool
-            except Exception as e:
-                print(f"    [postcar] {label} error ({spec['label']}): {e}")
-                break
+    """Call the parent agent's configured LLM exactly once. No fallback to a
+    different provider on failure — log why and return None instead."""
+    provider = _llm_provider()
 
-    # 4: API fallback
-    api_key = _llm_api_key()
-    if api_key:
+    if provider == "api":
+        api_key = _llm_api_key()
+        if not api_key:
+            print(f"    [postcar] {label} error: POSTCAR_LLM_PROVIDER=api but no API key found")
+            return None
         try:
             from openai import OpenAI
             client = OpenAI(api_key=api_key, base_url=_llm_base_url())
@@ -782,6 +780,32 @@ def _call_llm(prompt: str, label: str = "llm", max_tokens: int = 400) -> dict | 
             return _extract_json(resp.choices[0].message.content.strip())
         except Exception as e:
             print(f"    [postcar] {label} error (api): {e}")
+            return None
+
+    bins = _llm_cli_bins(provider)
+    args = _llm_cli_args(provider)
+
+    for binary in bins:
+        try:
+            result = _subprocess.run(
+                [binary] + args,
+                input=prompt,
+                capture_output=True, text=True, timeout=60,
+            )
+        except FileNotFoundError:
+            continue  # try the next known path for this same tool, not a different tool
+        except Exception as e:
+            print(f"    [postcar] {label} error ({provider}): {e}")
+            return None
+        if result.returncode != 0:
+            print(f"    [postcar] {label} error ({provider}): exit {result.returncode}: {(result.stderr or '').strip()[:200]}")
+            return None
+        parsed = _extract_json((result.stdout or "").strip())
+        if parsed is None:
+            print(f"    [postcar] {label} error ({provider}): no JSON found in output")
+        return parsed
+
+    print(f"    [postcar] {label} error: '{provider}' binary not found in any known path")
     return None
 
 
