@@ -7,9 +7,17 @@ exact strings), so every agent on the network converges on the same
 vocabulary instead of inventing its own synonyms.
 
 Structure:
-  TIER1_DOMAINS   — ~50 domain:<x> tags, one per top-level domain.
-  TIER1_IDENTITIES — ~50 identity:<x>-agent tags, one per domain (paired 1:1).
-    Together TIER1_DOMAINS + TIER1_IDENTITIES = the ~100-option tier1 space.
+  TIER1_DOMAINS — ~50 domain:<x> tags, one per subject-matter domain (what
+    industry/field the agent operates in).
+  TIER1_ROLES — ~50 identity:<x> tags, one per functional role archetype
+    (what kind of agent it IS, independent of domain). Deliberately NOT
+    paired 1:1 with domain -- a role like tutor or personal-assistant cuts
+    across every domain, and a domain like finance contains multiple
+    distinct roles (trading-agent, analyst, advisor, auditor are all
+    "finance" but do different jobs). An agent gets tagged with domain(s)
+    AND role(s) independently, e.g. SMoney = domain:finance +
+    identity:trading-agent, not some single merged "finance-agent" tag.
+    Together TIER1_DOMAINS + TIER1_ROLES = the ~100-option tier1 space.
   TIER2_BY_DOMAIN — dict: domain key -> list of skill:/strategy: tags scoped
     to that domain. A classifier should only ever be shown the tier2 subset
     for the tier1 domain(s) it already picked, never the full flattened list
@@ -27,7 +35,7 @@ non-overlapping tags), so depth is weighted toward validated usage instead.
 from __future__ import annotations
 
 # ---------------------------------------------------------------------------
-# TIER 1 — domains + paired identities (~100 total)
+# TIER 1 — domains (subject matter) + roles (function), independent axes
 # ---------------------------------------------------------------------------
 
 _DOMAIN_KEYS = [
@@ -44,10 +52,27 @@ _DOMAIN_KEYS = [
 ]
 
 TIER1_DOMAINS = [f"domain:{k}" for k in _DOMAIN_KEYS]
-TIER1_IDENTITIES = [f"identity:{k.replace('_', '-')}-agent" for k in _DOMAIN_KEYS]
 
-# Combined tier1 option set an LLM classifier picks 1+ from.
-TIER1_TAXONOMY = TIER1_DOMAINS + TIER1_IDENTITIES
+# Functional role archetypes -- what kind of agent it IS, not what field it's
+# in. Not generated from _DOMAIN_KEYS on purpose (see module docstring).
+_ROLE_KEYS = [
+    "trading-agent", "personal-assistant", "tutor", "coding-assistant",
+    "customer-service-agent", "research-assistant", "writer", "translator",
+    "scheduler", "negotiator", "advisor", "analyst", "auditor", "monitor",
+    "orchestrator", "curator", "concierge", "matchmaker", "planner",
+    "generalist", "moderator", "reviewer", "summarizer", "watchdog",
+    "underwriter", "dispatcher", "recruiter", "screener", "triager",
+    "investigator", "forecaster", "optimizer", "compliance-officer",
+    "risk-manager", "copilot", "proofreader", "fact-checker", "mediator",
+    "coach", "counselor", "broker", "appraiser", "estimator", "classifier",
+    "archivist", "liaison", "facilitator", "strategist", "executor",
+    "gatekeeper",
+]
+
+TIER1_ROLES = [f"identity:{k}" for k in _ROLE_KEYS]
+
+# Combined tier1 option set an LLM classifier picks 1+ domain and 1+ role from.
+TIER1_TAXONOMY = TIER1_DOMAINS + TIER1_ROLES
 
 
 # ---------------------------------------------------------------------------
