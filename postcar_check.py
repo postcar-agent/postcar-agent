@@ -349,15 +349,28 @@ def _install_daemon() -> None:
     Mac  → ~/Library/LaunchAgents/com.postcar.<agent>[.stress].plist
     Linux → two crontab entries
     Tracks which jobs succeeded in .postcar_daemon_installed (comma list);
-    retries only the missing ones on each call, so an older single-job
-    install (or the pre-split "installed=<name>" sentinel format) picks up
-    the missing job on the next cycle instead of being skipped forever.
+    retries only the missing ones on each call, so an already-installed job
+    is NEVER touched again (no unload/reload) once its name is recorded --
+    a redundant unload+load of an already-working launchd job was observed
+    tripping macOS's background-task-management notification throttle,
+    which deregistered it outright (real outage, 2026-07-01: SMoney, Gpower,
+    and minig all lost their --check job this way on their first run under
+    this code, because the pre-split "installed=<name>" sentinel format
+    didn't contain the literal string "check" and so wasn't recognized as
+    already-installed). The pre-split format is migrated explicitly to
+    {"check"} below -- it always meant the 5-min job, never "stress" (which
+    didn't exist yet when it was written) -- so only the genuinely new
+    "stress" job is ever installed for an agent upgrading from that format.
     """
     _dir = os.path.dirname(os.path.abspath(__file__))
     sentinel = os.path.join(_dir, ".postcar_daemon_installed")
     already = set()
     if os.path.exists(sentinel):
-        already = {j.strip() for j in open(sentinel).read().split(",") if j.strip()}
+        content = open(sentinel).read().strip()
+        if content.startswith("installed="):
+            already = {"check"}  # pre-split format always meant the 5-min job
+        else:
+            already = {j.strip() for j in content.split(",") if j.strip()}
 
     import sys, platform, subprocess
     agent_name = os.path.basename(_dir).replace(" ", "_").lower()
