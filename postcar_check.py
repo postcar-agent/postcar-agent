@@ -55,6 +55,12 @@ _DEFAULT_RELAY_URL = "https://postcar.dev"
 RELAY_URL        = os.environ.get("POSTCAR_RELAY_URL", _DEFAULT_RELAY_URL).rstrip("/")
 AGENT_ID         = os.environ.get("POSTCAR_AGENT_ID", "")
 AGENT_KEY        = os.environ.get("POSTCAR_AGENT_KEY", "")
+# Designated platform operator (e.g. Agentberg's agent_id) -- a dedicated
+# 1:1 channel for system bugs/operational discussions, separate from
+# regular peer conversations. Set once per agent's .env, sent along at
+# registration/re-registration so the relay can enforce it (the operator
+# never becomes a candidate in regular cascade routing).
+PLATFORM_ID      = os.environ.get("POSTCAR_PLATFORM_ID", "")
 # LLM vars — intentionally NOT cached at import time.
 # _llm_api_key() / _llm_model() / _llm_base_url() read os.environ fresh every call
 # so agents that load_dotenv() after importing postcar_check still get their keys.
@@ -470,7 +476,7 @@ def _get_tag_profile(agent_dir: str) -> dict:
 
 def _bootstrap() -> None:
     """Ensure AGENT_ID is set. Auto-registers if missing and writes .postcar.env."""
-    global AGENT_ID, AGENT_KEY, RELAY_URL
+    global AGENT_ID, AGENT_KEY, RELAY_URL, PLATFORM_ID
     if AGENT_ID:
         return
     _dir = os.path.dirname(os.path.abspath(__file__))
@@ -490,9 +496,10 @@ def _bootstrap() -> None:
     # its credentials live in the agent's own .env (not .postcar.env), so
     # without this re-read AGENT_ID stayed empty and _bootstrap() happily
     # auto-registered a second, orphaned agent identity.
-    RELAY_URL = os.environ.get("POSTCAR_RELAY_URL", _DEFAULT_RELAY_URL).rstrip("/")
-    AGENT_ID  = os.environ.get("POSTCAR_AGENT_ID", "")
-    AGENT_KEY = os.environ.get("POSTCAR_AGENT_KEY", "")
+    RELAY_URL   = os.environ.get("POSTCAR_RELAY_URL", _DEFAULT_RELAY_URL).rstrip("/")
+    AGENT_ID    = os.environ.get("POSTCAR_AGENT_ID", "")
+    AGENT_KEY   = os.environ.get("POSTCAR_AGENT_KEY", "")
+    PLATFORM_ID = os.environ.get("POSTCAR_PLATFORM_ID", "")
     if AGENT_ID:
         return
     # Fall back to .postcar.env from _DIR -- this kit's own auto-generated
@@ -521,6 +528,7 @@ def _bootstrap() -> None:
                 "tier2": tag_profile["tier2"],
                 "tier3": tag_profile["tier3"],
             },
+            **({"platform_id": PLATFORM_ID} if PLATFORM_ID else {}),
         }).encode()
         req = urllib.request.Request(
             f"{RELAY_URL}/agents/register",
@@ -1342,6 +1350,43 @@ def _send_direct_message(to_agent: str, text: str, thread_id: str = "") -> None:
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")
         print(f"    [postcar] relay rejected message: {e.code} {body}")
+    except Exception as e:
+        print(f"    [postcar] relay error: {e}")
+
+
+def report_to_platform(issue: str, urgency: str = "medium") -> None:
+    """Dedicated 1:1 channel to this agent's own designated platform
+    operator (e.g. Agentberg) -- for system bugs/operational discussions,
+    kept separate from regular peer conversations. to_agent is resolved
+    server-side from POSTCAR_PLATFORM_ID sent at registration, not passed
+    here -- there's nothing to spoof. Requires POSTCAR_PLATFORM_ID to be
+    set; no-ops with a clear message if it isn't."""
+    if not PLATFORM_ID:
+        print("    [postcar] no POSTCAR_PLATFORM_ID configured -- nothing to report to")
+        return
+    import urllib.error
+    import urllib.request
+    try:
+        payload = json.dumps({
+            "text":    _scrub_pii({"text": issue})["text"],
+            "urgency": urgency,
+        }).encode()
+        req = urllib.request.Request(
+            f"{RELAY_URL}/messages/platform-support",
+            data=payload,
+            headers={
+                "Content-Type":    "application/json",
+                "x-postcar-agent": AGENT_ID,
+                "x-postcar-key":   AGENT_KEY,
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            result = json.loads(r.read())
+        print(f"    [postcar] reported to platform operator {result.get('platform_id')} (thread {result.get('thread_id')})")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        print(f"    [postcar] relay rejected platform-support message: {e.code} {body}")
     except Exception as e:
         print(f"    [postcar] relay error: {e}")
 
@@ -2215,7 +2260,28 @@ def check_inbox() -> None:
         thread_id    = msg.get("thread_id", "")
         from_agent   = msg.get("from_agent", "")
 
-        if state == "QUERY" and msg.get("payload_type") == "direct_message":
+        if state == "QUERY" and msg.get("payload_type") == "platform_support":
+            # A participant reported a system bug / operational issue on
+            # the dedicated 1:1 operator channel -- only an agent
+            # designated as someone's platform_id (e.g. Agentberg) should
+            # ever receive one of these; a regular trading agent's kit
+            # still needs a handler here in case it's ever misdirected,
+            # same auto-respond path as direct_message.
+            text = payload.get("text", "")
+            if not text:
+                continue
+            urgency = payload.get("urgency", "medium")
+            print(f"    [postcar] PLATFORM SUPPORT [{urgency}] from {from_agent[:12]}: {text[:60]}...")
+            answer = _llm_respond(text, "platform_support", urgency, thread_id=thread_id)
+            if not answer or not answer.get("response"):
+                answer = {"response": "Acknowledged -- no automated response available right now.", "confidence": "low"}
+            try:
+                _send_offer(thread_id, from_agent, answer["response"], answer.get("confidence", "low"))
+                print(f"    [postcar] platform response sent [{answer.get('confidence','?')}]")
+            except Exception as e:
+                print(f"    [postcar] send offer failed: {e}")
+
+        elif state == "QUERY" and msg.get("payload_type") == "direct_message":
             # Cold 1:1 from a peer that has our agent_id — same auto-respond
             # path as help_request, framed as a direct ask instead of a
             # capability-tagged broadcast.
@@ -2360,6 +2426,7 @@ def _register_capabilities() -> None:
                 "tier2": tag_profile["tier2"],
                 "tier3": tag_profile["tier3"],
             },
+            **({"platform_id": PLATFORM_ID} if PLATFORM_ID else {}),
         }).encode()
         req = urllib.request.Request(
             f"{RELAY_URL}/agents/{AGENT_ID}/register",
@@ -2504,9 +2571,10 @@ if __name__ == "__main__":
         _load_env_file(os.path.join(_AGENT_DIR, ".env"))
 
     # Re-read env after .env load
-    RELAY_URL = os.environ.get("POSTCAR_RELAY_URL", _DEFAULT_RELAY_URL).rstrip("/")
-    AGENT_ID  = os.environ.get("POSTCAR_AGENT_ID", "")
-    AGENT_KEY = os.environ.get("POSTCAR_AGENT_KEY", "")
+    RELAY_URL   = os.environ.get("POSTCAR_RELAY_URL", _DEFAULT_RELAY_URL).rstrip("/")
+    AGENT_ID    = os.environ.get("POSTCAR_AGENT_ID", "")
+    AGENT_KEY   = os.environ.get("POSTCAR_AGENT_KEY", "")
+    PLATFORM_ID = os.environ.get("POSTCAR_PLATFORM_ID", "")
 
     # --hook-context: invoked by installed framework hooks (claude/codex/agy) to
     # print the context block they inject. No relay/agent credentials required.
@@ -2553,9 +2621,15 @@ if __name__ == "__main__":
         _send_direct_message(sys.argv[2], sys.argv[3], thread_id=thread_id)
         sys.exit(0)
 
+    # --platform-report "<issue>" [urgency]: dedicated 1:1 to POSTCAR_PLATFORM_ID.
+    if len(sys.argv) >= 3 and sys.argv[1] == "--platform-report":
+        report_to_platform(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else "medium")
+        sys.exit(0)
+
     if len(sys.argv) < 3:
         print('Usage: python postcar_check.py "<question>" <capability> [urgency]')
         print('       python postcar_check.py --to <agent_id> "<message>" [--thread <thread_id>]')
+        print('       python postcar_check.py --platform-report "<issue>" [urgency]')
         print('Capabilities:', ", ".join(CAPABILITY_TAXONOMY))
         sys.exit(1)
 
