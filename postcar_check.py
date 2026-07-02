@@ -842,8 +842,51 @@ def _try_write_context_file() -> None:
         pass
 
 
+_CLAUDE_MD_PATH_PATTERN_SRC = r"`(~?/[^`\s]+\.(?:md|txt|json|yaml|yml))`"
+
+
+def _read_referenced_knowledge(agent_dir: str) -> str:
+    """Follow file paths CLAUDE.md/README.md explicitly reference as where
+    this agent's real knowledge lives (e.g. `~/.claude/projects/.../memory/
+    trading_learnings.md`), and read them directly. The human already wrote
+    these locations down for Claude's own benefit -- reuse that instead of
+    guessing at db schemas or requiring a per-agent adapter file."""
+    import re
+    pattern = re.compile(_CLAUDE_MD_PATH_PATTERN_SRC)
+    seen: set[str] = set()
+    sections = []
+    for filename in ("CLAUDE.md", "README.md"):
+        fpath = os.path.join(agent_dir, filename)
+        if not os.path.exists(fpath):
+            continue
+        try:
+            text = open(fpath, "r", encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        for m in pattern.finditer(text):
+            candidate = os.path.expanduser(m.group(1))
+            if not os.path.isabs(candidate):
+                candidate = os.path.join(agent_dir, candidate)
+            candidate = os.path.normpath(candidate)
+            if candidate in seen or not os.path.isfile(candidate):
+                continue
+            seen.add(candidate)
+            if len(seen) > 5:
+                break
+            try:
+                content = open(candidate, "r", encoding="utf-8", errors="replace").read()
+            except OSError:
+                continue
+            sections.append(f"--- {os.path.basename(candidate)} ---\n{content[:1500]}")
+    return "\n\n".join(sections)
+
+
 def _build_context() -> str:
-    """Read agent context. Tries .postcar_context.json first, then memory module."""
+    """Read agent context: .postcar_context.json, memory module, and any
+    knowledge files CLAUDE.md/README.md explicitly point to -- combined,
+    not first-match-wins, since each covers a different gap."""
+    parts = []
+
     # 1. Generic context file — works for any agent type
     if os.path.exists(_CONTEXT_FILE):
         try:
@@ -851,7 +894,7 @@ def _build_context() -> str:
             if isinstance(data, dict):
                 lines = [f"{k}: {v}" for k, v in data.items() if v is not None]
                 if lines:
-                    return "\n".join(lines)
+                    parts.append("\n".join(lines))
         except Exception:
             pass
 
@@ -899,11 +942,19 @@ def _build_context() -> str:
         except Exception:
             pass
         if lines:
-            return "\n".join(lines)
+            parts.append("\n".join(lines))
     except ImportError:
         pass
 
-    return "no agent context available"
+    # 3. Knowledge files CLAUDE.md/README.md explicitly reference
+    try:
+        referenced = _read_referenced_knowledge(_AGENT_DIR)
+        if referenced:
+            parts.append(referenced)
+    except Exception:
+        pass
+
+    return "\n\n".join(parts) if parts else "no agent context available"
 
 
 _STORE_SPEC_CACHE = os.path.join(_DIR, ".postcar_store_spec.json")
