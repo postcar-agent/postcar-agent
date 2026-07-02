@@ -1716,16 +1716,30 @@ def build_session_intro() -> str:
     return f"<postcar-context>\n{_POSTCAR_INTRO}\n</postcar-context>"
 
 
+_GUIDANCE_REMINDER_EXCERPT_CHARS = 200
+
+
 def _render_guidance_item(e: dict) -> str:
     """Render one guidance record. raw_content is a peer agent's message — untrusted
     — and is wrapped separately from PostCar's own trusted framing/evaluation so it
-    cannot be crafted to spoof a system instruction (prompt-injection quarantine)."""
+    cannot be crafted to spoof a system instruction (prompt-injection quarantine).
+
+    Excerpt only, not the full message: this renders on every UserPromptSubmit
+    hook call, so full untruncated content here breaks Anthropic's prefix
+    prompt-cache on every single turn for as long as the item stays pending
+    (up to 72h) -- measured ~178x input-token spike across the fleet from
+    exactly this. Full text is still available via decide_guidance()/inbox
+    pulls when actually needed, not required on every turn."""
     ev = e.get("evaluation", {}) or {}
+    raw = e.get("raw_content", "") or ""
+    excerpt = raw[:_GUIDANCE_REMINDER_EXCERPT_CHARS]
+    if len(raw) > _GUIDANCE_REMINDER_EXCERPT_CHARS:
+        excerpt += "..."
     return (
         f'  <postcar-guidance-item id="{e.get("message_id","")}" '
         f'sender="{e.get("sender_agent_id","")}" tier="{e.get("sender_tier","")}" '
         f'status="{e.get("status","")}">\n'
-        f'    <untrusted-network-content>\n{e.get("raw_content","")}\n</untrusted-network-content>\n'
+        f'    <untrusted-network-content>\n{excerpt}\n</untrusted-network-content>\n'
         f'    <postcar-evaluation>{json.dumps(ev)}</postcar-evaluation>\n'
         f'  </postcar-guidance-item>'
     )
@@ -1733,9 +1747,15 @@ def _render_guidance_item(e: dict) -> str:
 
 def build_pending_reminder() -> str:
     """Short reminder. Inject per-turn via a UserPromptSubmit hook, only when
-    pending/acked records exist — not a full re-explain of what PostCar is."""
+    pending records exist — not a full re-explain of what PostCar is.
+
+    'acked' is excluded on purpose: acking means the host has already seen
+    this item once. Re-rendering identical content every subsequent turn
+    for something already acknowledged adds no information and only costs
+    cache-prefix stability -- the item still exists in .postcar_guidance
+    for decide_guidance() to act on later, it just stops riding every turn."""
     entries = _load_guidance()
-    pending = [e for e in entries if e.get("status") in ("pending", "acked")]
+    pending = [e for e in entries if e.get("status") == "pending"]
     if not pending:
         return ""
     lines = [f'<postcar-guidance-pending count="{len(pending)}">']
