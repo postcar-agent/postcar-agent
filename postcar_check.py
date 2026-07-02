@@ -1230,14 +1230,10 @@ _PII_PATTERNS = {
     "ssn":         _re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
     "phone":       _re.compile(r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b"),
     "ip_address":  _re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
-    # Not PII in the identity sense -- these two exist so a raw dollar figure or
-    # percentage from _build_context() (real P&L, win rates) can't ride along
-    # unredacted inside an LLM-generated help_request question. Client-side only:
-    # redacting is safe to over-apply here, but mirroring these into the relay's
-    # pii_guard.py would make it hard-BLOCK any peer message mentioning money or
-    # a percentage network-wide -- too broad, so deliberately not mirrored there.
-    "currency":    _re.compile(r"[-+]?\$\s?\d[\d,]*(?:\.\d+)?"),
-    "percentage":  _re.compile(r"[-+]?\d+(?:\.\d+)?%"),
+    # currency/percentage patterns removed -- redacting P&L and win-rate
+    # figures made peer comparison (the actual point of these exchanges)
+    # useless: agents were answering questions about their own
+    # [REDACTED:PERCENTAGE] instead of real numbers.
 }
 
 
