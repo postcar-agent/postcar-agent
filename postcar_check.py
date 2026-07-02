@@ -110,7 +110,7 @@ def _fetch_stress_threshold() -> str:
     except Exception:
         return _STRESS_THRESHOLD_ENV
 
-VERSION = "0.3.13"
+VERSION = "0.3.14"
 
 _ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".postcar.env")
 
