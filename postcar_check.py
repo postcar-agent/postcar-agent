@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 import uuid
 
@@ -475,12 +476,20 @@ def _bootstrap() -> None:
         if os.path.exists(_env_candidate):
             _load_env_file(_env_candidate)
             break
-    # _load_env_file() only touches os.environ -- RELAY_URL was already bound
-    # from os.environ at module-import time, before any .env was loaded, so
-    # it must be re-read now or a RELAY_URL set only via .env (the documented,
-    # "zero-config" way) is invisible to the auto-register check below.
+    # _load_env_file() only touches os.environ -- RELAY_URL/AGENT_ID/AGENT_KEY
+    # were already bound from os.environ at module-import time, before any
+    # .env was loaded, so they must be re-read now. Missing this caused a
+    # real duplicate registration migrating SMoney to the git-clone layout:
+    # its credentials live in the agent's own .env (not .postcar.env), so
+    # without this re-read AGENT_ID stayed empty and _bootstrap() happily
+    # auto-registered a second, orphaned agent identity.
     RELAY_URL = os.environ.get("POSTCAR_RELAY_URL", "").rstrip("/")
-    # Try loading .postcar.env from _DIR
+    AGENT_ID  = os.environ.get("POSTCAR_AGENT_ID", "")
+    AGENT_KEY = os.environ.get("POSTCAR_AGENT_KEY", "")
+    if AGENT_ID:
+        return
+    # Fall back to .postcar.env from _DIR -- this kit's own auto-generated
+    # credentials cache, for agents with no pre-existing .env credentials.
     env_path = os.path.join(_dir, ".postcar.env")
     if os.path.exists(env_path):
         _load_env_file(env_path)
@@ -676,6 +685,15 @@ _DIR               = os.path.dirname(os.path.abspath(__file__))
 _AGENT_DIR         = _agent_root(_DIR)  # parent agent's own dir -- see _agent_root()
 _LAST_RAN_FILE     = os.path.join(_DIR, ".postcar_last_ran")
 _UPGRADE_FLAG_FILE = os.path.join(_DIR, ".postcar_upgrade_pending")
+
+# _build_context()'s `import memory` fallback (agentberg-starter pattern)
+# needs the agent's own directory importable -- when this kit is nested in
+# postcar/ (the standard git-clone layout), Python only auto-adds this
+# file's own directory to sys.path, not the agent's, so that import would
+# otherwise silently fail (wrapped in a try/except -- no crash, just quiet
+# loss of the memory-based diagnostic context) for any agent relying on it.
+if _AGENT_DIR != _DIR and _AGENT_DIR not in sys.path:
+    sys.path.insert(0, _AGENT_DIR)
 
 _DIAGNOSTIC_PROMPT_HIGH = """You are a trading agent doing a real-time health check on open positions.
 
