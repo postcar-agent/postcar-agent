@@ -1351,19 +1351,6 @@ def _send_direct_message(to_agent: str, text: str, thread_id: str = "") -> None:
 _GUIDANCE_FILE     = os.path.join(_DIR, ".postcar_guidance")
 _ASKED_TOPICS_FILE = os.path.join(_DIR, ".postcar_asked_topics.json")
 
-_SEMANTIC_DUPE_PROMPT = """You are comparing trading agent questions.
-
-New question:
-{new_question}
-
-Questions asked in the last 24 hours:
-{past_questions}
-
-Is the new question semantically equivalent to any past question — same concern, same metric, same situation, even if worded differently?
-
-Return JSON only: {{"duplicate": true}} or {{"duplicate": false}}"""
-
-
 def _load_recent_questions(hours: int = 24) -> list:
     try:
         if not os.path.exists(_ASKED_TOPICS_FILE):
@@ -1375,20 +1362,26 @@ def _load_recent_questions(hours: int = 24) -> list:
         return []
 
 
+_DUPE_SIMILARITY_THRESHOLD = 0.6
+
+
 def _is_semantic_dupe(new_question: str) -> bool:
-    """Ask local LLM if new_question is semantically equivalent to any question asked in last 24h."""
+    """difflib-based near-duplicate check against questions asked in the last
+    24h -- no LLM call. The observed failure mode this guards against is
+    literal rewording (same words/structure, minor phrasing changes), which
+    sequence-matching catches well; it won't catch a genuinely different
+    phrasing of the same underlying concern (deep paraphrase), but at this
+    scale (n in the tens per agent per day) a plain O(n) comparison loop is
+    the right tool -- no need for embeddings or LSH bucketing to avoid
+    pairwise comparison when there's nothing expensive to avoid."""
+    import difflib
     past = _load_recent_questions()
     if not past:
         return False
-    numbered = "\n".join(f"{i+1}. {q}" for i, q in enumerate(past))
-    prompt = _SEMANTIC_DUPE_PROMPT.format(new_question=new_question, past_questions=numbered)
-    try:
-        raw = _ask_llm_raw(prompt, minimal_tools=True)
-        if isinstance(raw, dict):
-            return bool(raw.get("duplicate", False))
-        return False
-    except Exception:
-        return False
+    return any(
+        difflib.SequenceMatcher(None, new_question, q).ratio() >= _DUPE_SIMILARITY_THRESHOLD
+        for q in past
+    )
 
 
 def _record_asked_question(question: str, capability: str) -> None:
