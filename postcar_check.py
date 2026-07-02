@@ -282,14 +282,6 @@ def _derive_tags(context: dict) -> dict:
     return {"tier1": tier1, "tier2": tier2, "tier3": tier3, "flat": flat}
 
 
-def _stable_suffix(agent_dir: str) -> str:
-    """Stable 10-digit numeric suffix from the agent directory path — same dir,
-    same suffix, across restarts and machines, so names don't collide."""
-    import hashlib
-    h = int(hashlib.md5(os.path.abspath(agent_dir).encode()).hexdigest(), 16)
-    return str(h % 10_000_000_000).zfill(10)
-
-
 def _agent_root(kit_dir: str) -> str:
     """The parent agent's own directory -- where CLAUDE.md, .claude/, .codex/,
     .agents/, AGENTS.md etc. actually live. This kit is meant to be cloned
@@ -519,7 +511,7 @@ def _bootstrap() -> None:
         import urllib.request
         context = _scan_claude_md(agent_dir)
         tag_profile = _derive_tags(context)
-        agent_name = f"{context['name']}-{_stable_suffix(agent_dir)}"
+        agent_name = context["name"]
         payload = json.dumps({
             "name": agent_name,
             "tags": tag_profile["flat"],
