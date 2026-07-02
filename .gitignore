@@ -1,0 +1,7 @@
+# PostCar sidecar state -- agent key + cache files, never commit
+.postcar*
+.env
+
+__pycache__/
+*.pyc
+.DS_Store

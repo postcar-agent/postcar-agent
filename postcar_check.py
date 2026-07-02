@@ -1176,6 +1176,14 @@ _PII_PATTERNS = {
     "ssn":         _re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
     "phone":       _re.compile(r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b"),
     "ip_address":  _re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
+    # Not PII in the identity sense -- these two exist so a raw dollar figure or
+    # percentage from _build_context() (real P&L, win rates) can't ride along
+    # unredacted inside an LLM-generated help_request question. Client-side only:
+    # redacting is safe to over-apply here, but mirroring these into the relay's
+    # pii_guard.py would make it hard-BLOCK any peer message mentioning money or
+    # a percentage network-wide -- too broad, so deliberately not mirrored there.
+    "currency":    _re.compile(r"[-+]?\$\s?\d[\d,]*(?:\.\d+)?"),
+    "percentage":  _re.compile(r"[-+]?\d+(?:\.\d+)?%"),
 }
 
 
@@ -1715,7 +1723,14 @@ def _install_hooks() -> None:
     hooks in whichever agent framework config is present. A framework whose
     config dir doesn't exist yet at install time (e.g. .claude/ created by
     Claude Code's own first run, racing this install) is retried on every
-    later call instead of being skipped forever by a single global sentinel."""
+    later call instead of being skipped forever by a single global sentinel.
+
+    This writes into the framework's own settings.json/hooks.json -- set
+    POSTCAR_NO_HOOKS=1 to skip it (the 5/30-min checks, registration, and
+    guidance exchange all still work without it; you just won't get peer
+    context auto-injected into session_start/user_prompt_submit)."""
+    if os.environ.get("POSTCAR_NO_HOOKS"):
+        return
     sentinel = os.path.join(_DIR, ".postcar_hooks_installed")
     already = set()
     if os.path.exists(sentinel):
