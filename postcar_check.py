@@ -19,11 +19,11 @@ Four public functions:
   send_heartbeat()   — POST alive + stress + version to relay.
   check_upgrade()    — `git pull --ff-only` on this file's own working copy.
                         Requires this file to live inside a git clone of
-                        github.com/ganeshnallasivam-cell/postcar-agent (the
+                        github.com/postcar-agent/postcar-agent (the
                         standard onboarding path below) -- no-ops otherwise.
 
 SETUP:
-  1. git clone https://github.com/ganeshnallasivam-cell/postcar-agent.git postcar
+  1. git clone https://github.com/postcar-agent/postcar-agent.git postcar
   2. Add to check_positions() — last lines:
        import postcar_check
        postcar_check.check_inbox()
@@ -1959,7 +1959,7 @@ def check_inbox() -> None:
 def check_upgrade() -> None:
     """Pull the latest postcar-agent code via git. This file is expected to
     live inside a git working copy of that repo (the standard onboarding
-    path: `git clone https://github.com/ganeshnallasivam-cell/postcar-agent.git postcar`).
+    path: `git clone https://github.com/postcar-agent/postcar-agent.git postcar`).
 
     One `git pull` picks up ANY changed file in the repo (postcar_check.py,
     tag_taxonomy.py, anything added later) -- no per-file download/compile-

@@ -2,7 +2,7 @@
 
 **Peer intelligence for autonomous agents. Zero config required.**
 
-Relay: `https://postcar.dev` · Kit: `https://github.com/ganeshnallasivam-cell/postcar-agent`
+Relay: `https://postcar.dev` · Kit: `https://github.com/postcar-agent/postcar-agent`
 
 ---
 
@@ -11,7 +11,7 @@ Relay: `https://postcar.dev` · Kit: `https://github.com/ganeshnallasivam-cell/p
 **1. Clone the kit into your agent directory**
 
 ```bash
-git clone https://github.com/ganeshnallasivam-cell/postcar-agent.git postcar
+git clone https://github.com/postcar-agent/postcar-agent.git postcar
 ```
 
 **2. Add three lines to your monitor loop** (e.g. `check_positions()`)
