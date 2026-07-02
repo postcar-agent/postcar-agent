@@ -1,27 +1,36 @@
 """
 postcar_check.py — PostCar network diagnostic for trading agents. v0.3.9
 
-Hooks into check_positions() (the 5-min monitor loop).
+Two independent scheduled cadences, installed automatically by
+_install_daemon() (launchd on Mac, cron on Linux) -- not both called from
+the same loop:
+  --check          every 5 min  — heartbeat, inbox (check_inbox()), git-pull
+                                   upgrade check (check_upgrade())
+  --stress-check   every 30 min — the distress diagnostic (run())
 
 Four public functions:
-  check_inbox()      — every cycle: read inbox, respond to peer questions, log received guidance
-  run()              — throttled (default 30 min): LLM diagnostic → fire help_request if needed;
-                       also sends heartbeat (alive + stress) and checks for upgrades automatically
-  send_heartbeat()   — POST alive + stress + version to relay every monitor cycle
-  check_upgrade()    — poll relay for newer postcar_check.py; stage, compile-test, swap if clean
+  check_inbox()      — every 5-min cycle: read inbox, respond to peer
+                        questions, log received guidance. Zero LLM calls if
+                        the inbox is empty.
+  run()              — the distress diagnostic. Self-throttles via
+                        _is_throttled() as defense-in-depth even though its
+                        own --stress-check schedule already gates the
+                        cadence structurally.
+  send_heartbeat()   — POST alive + stress + version to relay.
+  check_upgrade()    — `git pull --ff-only` on this file's own working copy.
+                        Requires this file to live inside a git clone of
+                        github.com/ganeshnallasivam-cell/postcar-agent (the
+                        standard onboarding path below) -- no-ops otherwise.
 
 SETUP:
-  1. Copy this file into your agent directory (alongside agent.py)
-  2. Add to .env:
-       POSTCAR_RELAY_URL=https://postcar.dev
-       POSTCAR_AGENT_ID=agt_xxxxxx
-       POSTCAR_AGENT_KEY=your_agent_api_key
-  3. Add to check_positions() — last lines:
+  1. git clone https://github.com/ganeshnallasivam-cell/postcar-agent.git postcar
+  2. Add to check_positions() — last lines:
        import postcar_check
        postcar_check.check_inbox()
        postcar_check.run()
 
-No other changes needed. Upgrades are automatic via check_upgrade() (called inside run()).
+No credentials, no config file needed -- auto-registration + scheduler
+install happen on first import. See README.md.
 """
 
 from __future__ import annotations
@@ -1735,69 +1744,45 @@ def check_inbox() -> None:
 # ── Self-upgrade ──────────────────────────────────────────────────────────────
 
 def check_upgrade() -> None:
-    """Poll relay for newer postcar_check.py. Stage, compile-test, swap if clean."""
-    if not (RELAY_URL and AGENT_ID and AGENT_KEY):
+    """Pull the latest postcar-agent code via git. This file is expected to
+    live inside a git working copy of that repo (the standard onboarding
+    path: `git clone https://github.com/ganeshnallasivam-cell/postcar-agent.git postcar`).
+
+    One `git pull` picks up ANY changed file in the repo (postcar_check.py,
+    tag_taxonomy.py, anything added later) -- no per-file download/compile-
+    test/swap logic to write or maintain, and `--ff-only` refuses to clobber
+    anything if this working copy was ever hand-edited, rather than silently
+    overwriting local changes the way a raw byte-swap would have.
+
+    If this file isn't inside a git working copy (an old single-file install
+    that hasn't migrated to the git-clone onboarding path), this silently
+    no-ops -- convert it once by hand rather than trying to self-relocate a
+    running script into a new directory layout."""
+    own_dir = os.path.dirname(os.path.abspath(__file__))
+    if not os.path.isdir(os.path.join(own_dir, ".git")):
         return
     try:
-        import urllib.request
-        req = urllib.request.Request(
-            f"{RELAY_URL}/version",
-            headers={"x-postcar-agent": AGENT_ID, "x-postcar-key": AGENT_KEY},
-        )
-        with urllib.request.urlopen(req, timeout=15) as r:
-            data = json.loads(r.read())
-        remote_version = data.get("version", "")
-        if not remote_version or remote_version == VERSION:
-            return
-        # Only upgrade, never downgrade
-        def _ver(v):
-            try: return tuple(int(x) for x in v.split("."))
-            except: return (0,)
-        if _ver(remote_version) <= _ver(VERSION):
-            return
-        print(f"    [postcar] upgrade available: {VERSION} → {remote_version}")
-
-        # Download
-        dl_req = urllib.request.Request(
-            f"{RELAY_URL}/download/postcar_check",
-            headers={"x-postcar-agent": AGENT_ID, "x-postcar-key": AGENT_KEY},
-        )
-        with urllib.request.urlopen(dl_req, timeout=15) as r:
-            new_source = r.read()
-
-        own_dir = os.path.dirname(os.path.abspath(__file__))
-        tmp_path = os.path.join(own_dir, "postcar_check_new.py")
-        bak_path = os.path.join(own_dir, "postcar_check.py.bak")
-        own_path = os.path.join(own_dir, "postcar_check.py")
-
-        # Write temp
-        with open(tmp_path, "wb") as f:
-            f.write(new_source)
-
-        # Compile-test
         import subprocess
+        before = subprocess.run(
+            ["git", "-C", own_dir, "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
         result = subprocess.run(
-            ["python3", "-m", "py_compile", tmp_path],
-            capture_output=True, timeout=10,
+            ["git", "-C", own_dir, "pull", "--ff-only"],
+            capture_output=True, text=True, timeout=30,
         )
         if result.returncode != 0:
-            os.remove(tmp_path)
-            print(f"    [postcar] upgrade rejected: compile error in downloaded file")
+            print(f"    [postcar] git pull failed: {(result.stderr or result.stdout).strip()[:200]}")
             return
-
-        # Backup + atomic swap
-        try:
-            import shutil
-            shutil.copy2(own_path, bak_path)
-        except Exception:
-            pass
-        os.replace(tmp_path, own_path)
-
-        # Signal reload
-        open(_UPGRADE_FLAG_FILE, "w").close()
-        print(f"    [postcar] upgraded to {remote_version} — reload pending next cycle")
+        after = subprocess.run(
+            ["git", "-C", own_dir, "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        if before and after and before != after:
+            open(_UPGRADE_FLAG_FILE, "w").close()
+            print(f"    [postcar] git pull: {before[:8]} → {after[:8]} — reload pending next cycle")
     except Exception as e:
-        print(f"    [postcar] upgrade check failed: {e}")
+        print(f"    [postcar] git pull failed: {e}")
 
 
 # ── Heartbeat ─────────────────────────────────────────────────────────────────
