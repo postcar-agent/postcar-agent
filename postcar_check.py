@@ -295,6 +295,171 @@ def _agent_root(kit_dir: str) -> str:
     return kit_dir
 
 
+# ── LLM tag classification (closed taxonomy) ─────────────────────────────────
+#
+# _bootstrap()'s initial registration (below) deliberately keeps using cheap
+# keyword-matching (_derive_tags/_scan_claude_md) -- it runs at module-load
+# time, before _call_llm() is even defined later in this file, so it can't
+# safely call it. The LLM-based upgrade instead lives in _register_capabilities()
+# (called from run(), well after the whole module has finished loading): the
+# very first --stress-check cycle after registration replaces the keyword
+# guess with a real classification, then re-classifies weekly, not every
+# cycle -- a keyword-derived tag_profile is a fine fast placeholder for the
+# ~30 min until that first upgrade, not a permanent fallback.
+#
+# Classifies against the CLOSED taxonomy in tag_taxonomy.py (ships in the
+# same git-cloned postcar/ directory, no separate sync needed) rather than
+# open-ended generation, so the whole network converges on one vocabulary.
+# Two stages: pick domain(s) + role(s) from the ~100 tier1 options, then
+# skills from ONLY the tier2 subset scoped to the domain(s) already picked
+# (never the full ~500-tag flattened list) -- keeps this from reintroducing
+# the per-call token-cost problem fixed earlier the same night.
+
+try:
+    import tag_taxonomy as _taxonomy
+except ImportError:
+    _taxonomy = None  # older flat-layout install predating this file's addition
+
+_TAG_CLASSIFY_INTERVAL_DAYS = 7
+
+
+def _tag_classify_marker_path() -> str:
+    # Kit-owned state -- lives in _DIR (this file's own directory, i.e.
+    # postcar/), like every other .postcar_* state file, NOT the agent's own
+    # directory (agent_dir is only for context-scanning CLAUDE.md, never for
+    # where the kit writes its own files).
+    return os.path.join(_DIR, ".postcar_tag_classified_at")
+
+
+def _tag_profile_cache_path() -> str:
+    return os.path.join(_DIR, ".postcar_tag_profile.json")
+
+
+def _should_classify_tags() -> bool:
+    marker = _tag_classify_marker_path()
+    if not os.path.exists(marker):
+        return True
+    try:
+        last = float(open(marker).read().strip())
+        return (time.time() - last) >= (_TAG_CLASSIFY_INTERVAL_DAYS * 86400)
+    except Exception:
+        return True
+
+
+def _mark_tags_classified() -> None:
+    try:
+        with open(_tag_classify_marker_path(), "w") as f:
+            f.write(str(time.time()))
+    except Exception:
+        pass
+
+
+_TAG_TIER1_PROMPT = """You are classifying an autonomous agent for a peer network directory.
+
+Read the agent's own documentation below and pick tags that describe what
+this agent genuinely IS and does -- not what subject matter it discusses. A
+platform whose docs are ABOUT trading agents is not itself a trading agent;
+describing something is not being it. Judge identity from role and
+function, not from which keywords appear most often.
+
+Agent's own documentation:
+{raw_text}
+
+Pick from this closed list ONLY -- do not invent tags not listed here.
+
+Domains (subject matter -- pick 1-3 that are genuinely what this agent operates in):
+{domains}
+
+Roles (what kind of agent this IS -- pick 1-2):
+{roles}
+
+Return JSON only:
+{{"domains": ["domain:x", ...], "roles": ["identity:x", ...], "description": "one sentence describing what this agent actually is and does"}}"""
+
+_TAG_TIER2_PROMPT = """This agent's domain(s): {domains}
+
+Agent's own documentation:
+{raw_text}
+
+Pick the skills/strategies that genuinely apply, from this closed list ONLY
+-- do not invent tags not listed here:
+{tier2_options}
+
+Return JSON only:
+{{"skills": ["skill:x", ...]}}"""
+
+
+def _llm_classify_tags(agent_dir: str) -> dict | None:
+    """Two-stage LLM classification against tag_taxonomy.py's closed
+    vocabulary. Returns None (caller falls back to keyword-matching) if the
+    taxonomy module isn't present, or either stage fails/returns nothing
+    validatable -- never returns tags outside the closed list."""
+    if _taxonomy is None:
+        return None
+    context = _scan_claude_md(agent_dir)
+    raw_text = (context.get("raw_text") or "")[:3000]
+    if not raw_text.strip():
+        return None
+
+    stage1_prompt = _TAG_TIER1_PROMPT.format(
+        raw_text=raw_text,
+        domains="\n".join(_taxonomy.TIER1_DOMAINS),
+        roles="\n".join(_taxonomy.TIER1_ROLES),
+    )
+    stage1 = _call_llm(stage1_prompt, label="tag_classify_tier1", max_tokens=300, minimal_tools=True)
+    if not stage1:
+        return None
+    domains = [d for d in (stage1.get("domains") or []) if d in _taxonomy.TIER1_DOMAINS]
+    roles   = [r for r in (stage1.get("roles") or [])   if r in _taxonomy.TIER1_ROLES]
+    description = (stage1.get("description") or "")[:150]
+    if not domains:
+        return None  # need at least one valid domain to scope tier2
+
+    tier2_options = _taxonomy.tier2_options_for(domains)
+    skills = []
+    if tier2_options:
+        stage2_prompt = _TAG_TIER2_PROMPT.format(
+            domains=", ".join(domains),
+            raw_text=raw_text,
+            tier2_options="\n".join(tier2_options),
+        )
+        stage2 = _call_llm(stage2_prompt, label="tag_classify_tier2", max_tokens=200, minimal_tools=True) or {}
+        skills = [s for s in (stage2.get("skills") or []) if s in tier2_options]
+
+    tier1 = domains + roles
+    return {
+        "tier1": tier1,
+        "tier2": skills,
+        "tier3": description or "autonomous agent",
+        "flat": tier1 + skills,
+    }
+
+
+def _get_tag_profile(agent_dir: str) -> dict:
+    """The tag profile to send on this registration/re-registration call.
+    Re-classifies via LLM on the weekly cadence (or first-ever call);
+    otherwise reuses the last cached classification without another LLM
+    call. Falls back to keyword-matching if the taxonomy isn't available,
+    the LLM call fails, or no cache exists yet."""
+    if _should_classify_tags():
+        result = _llm_classify_tags(agent_dir)
+        _mark_tags_classified()  # don't retry every cycle even on failure
+        if result:
+            try:
+                with open(_tag_profile_cache_path(), "w") as f:
+                    json.dump(result, f, indent=2)
+            except Exception:
+                pass
+            return result
+    cache_path = _tag_profile_cache_path()
+    if os.path.exists(cache_path):
+        try:
+            return json.loads(open(cache_path).read())
+        except Exception:
+            pass
+    return _derive_tags(_scan_claude_md(agent_dir))
+
+
 def _bootstrap() -> None:
     """Ensure AGENT_ID is set. Auto-registers if missing and writes .postcar.env."""
     global AGENT_ID, AGENT_KEY, RELAY_URL
@@ -1815,11 +1980,13 @@ def check_upgrade() -> None:
 
 def _register_capabilities() -> None:
     """Ensure this agent is registered with all capability tags so peers can find it.
-    Also re-derives tag_profile from CLAUDE.md each call, so edits to CLAUDE.md
-    propagate to the relay without needing a fresh registration."""
+    Also re-derives tag_profile each call (LLM-classified against the closed
+    taxonomy weekly, keyword-matched fallback otherwise -- see
+    _get_tag_profile()), so edits to CLAUDE.md propagate to the relay
+    without needing a fresh registration."""
     try:
         import urllib.request
-        tag_profile = _derive_tags(_scan_claude_md(_AGENT_DIR))
+        tag_profile = _get_tag_profile(_AGENT_DIR)
         payload = json.dumps({
             "capabilities": CAPABILITY_TAXONOMY,
             "version": VERSION,
