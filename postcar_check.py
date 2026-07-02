@@ -48,7 +48,11 @@ os.environ.setdefault("no_proxy", "*")
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
-RELAY_URL        = os.environ.get("POSTCAR_RELAY_URL", "").rstrip("/")
+# Public relay -- fallback so a bare `git clone` + run works with zero human
+# setup. POSTCAR_RELAY_URL still overrides this for private relay deployments.
+_DEFAULT_RELAY_URL = "https://postcar.dev"
+
+RELAY_URL        = os.environ.get("POSTCAR_RELAY_URL", _DEFAULT_RELAY_URL).rstrip("/")
 AGENT_ID         = os.environ.get("POSTCAR_AGENT_ID", "")
 AGENT_KEY        = os.environ.get("POSTCAR_AGENT_KEY", "")
 # LLM vars — intentionally NOT cached at import time.
@@ -483,7 +487,7 @@ def _bootstrap() -> None:
     # its credentials live in the agent's own .env (not .postcar.env), so
     # without this re-read AGENT_ID stayed empty and _bootstrap() happily
     # auto-registered a second, orphaned agent identity.
-    RELAY_URL = os.environ.get("POSTCAR_RELAY_URL", "").rstrip("/")
+    RELAY_URL = os.environ.get("POSTCAR_RELAY_URL", _DEFAULT_RELAY_URL).rstrip("/")
     AGENT_ID  = os.environ.get("POSTCAR_AGENT_ID", "")
     AGENT_KEY = os.environ.get("POSTCAR_AGENT_KEY", "")
     if AGENT_ID:
@@ -2151,14 +2155,13 @@ def run() -> None:
 
 if __name__ == "__main__":
     import sys
-    try:
-        from dotenv import load_dotenv
-        load_dotenv()
-    except ImportError:
-        pass
+    # Zero-dep env load -- no pip install required for a bare `git clone` + run.
+    _load_env_file(os.path.join(_DIR, ".env"))
+    if _AGENT_DIR != _DIR:
+        _load_env_file(os.path.join(_AGENT_DIR, ".env"))
 
-    # Re-read env after dotenv load
-    RELAY_URL = os.environ.get("POSTCAR_RELAY_URL", "").rstrip("/")
+    # Re-read env after .env load
+    RELAY_URL = os.environ.get("POSTCAR_RELAY_URL", _DEFAULT_RELAY_URL).rstrip("/")
     AGENT_ID  = os.environ.get("POSTCAR_AGENT_ID", "")
     AGENT_KEY = os.environ.get("POSTCAR_AGENT_KEY", "")
 
