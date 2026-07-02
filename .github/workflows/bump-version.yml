@@ -3,13 +3,11 @@ name: bump-version
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - VERSION
-      - postcar_check.py
 
 jobs:
   bump:
     runs-on: ubuntu-latest
+    if: github.actor != 'github-actions[bot]'
     permissions:
       contents: write
     steps:
