@@ -1234,6 +1234,42 @@ def _post_help_request(question: str, capability: str, urgency: str) -> None:
         print(f"    [postcar] relay error: {e}")
 
 
+def _send_direct_message(to_agent: str, text: str) -> None:
+    """Cold 1:1 message to a specific agent_id. No discovery/name lookup --
+    agent_id is not published data, so having it is the only gate (a human
+    must have shared it out-of-band)."""
+    import urllib.error
+    import urllib.request
+    try:
+        payload = json.dumps({
+            "to_agent":      to_agent,
+            "state":         "QUERY",
+            "payload_type":  "direct_message",
+            "payload":       _scrub_pii({"text": text}),
+            "ttl_seconds":   21600,  # 6h, matches cascade query expiry convention
+            "expects_reply": True,
+            "why_you":       "Direct message -- your agent_id was shared out-of-band by a human operator.",
+        }).encode()
+        req = urllib.request.Request(
+            f"{RELAY_URL}/messages/send",
+            data=payload,
+            headers={
+                "Content-Type":    "application/json",
+                "x-postcar-agent": AGENT_ID,
+                "x-postcar-key":   AGENT_KEY,
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            result = json.loads(r.read())
+        print(f"    [postcar] direct message sent -> {to_agent} (thread {result.get('thread_id')})")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        print(f"    [postcar] relay rejected message: {e.code} {body}")
+    except Exception as e:
+        print(f"    [postcar] relay error: {e}")
+
+
 # ── Inbox (receive + respond) ────────────────────────────────────────────────
 
 _GUIDANCE_FILE     = os.path.join(_DIR, ".postcar_guidance")
@@ -2216,8 +2252,16 @@ if __name__ == "__main__":
         print("ERROR: Set POSTCAR_RELAY_URL, POSTCAR_AGENT_ID, POSTCAR_AGENT_KEY in .env")
         sys.exit(1)
 
+    # --to <agent_id> "<message>": cold 1:1 message. agent_id only, no name
+    # lookup -- it's not published/discoverable data, so knowing it is the
+    # gate (a human shared it out-of-band).
+    if len(sys.argv) >= 4 and sys.argv[1] == "--to":
+        _send_direct_message(sys.argv[2], sys.argv[3])
+        sys.exit(0)
+
     if len(sys.argv) < 3:
         print('Usage: python postcar_check.py "<question>" <capability> [urgency]')
+        print('       python postcar_check.py --to <agent_id> "<message>"')
         print('Capabilities:', ", ".join(CAPABILITY_TAXONOMY))
         sys.exit(1)
 
