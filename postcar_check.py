@@ -209,7 +209,10 @@ def _scan_claude_md(agent_dir: str) -> dict:
     for line in combined.splitlines():
         m = re.match(r"^#\s+(.+)", line)
         if m:
-            name = m.group(1).strip()
+            # H1 is often a doc title ("Agentberg — Claude Instructions"), not
+            # a clean identity name -- take only the segment before a
+            # separator so the registered name matches the product name.
+            name = re.split(r"\s[-—–:]\s", m.group(1).strip(), maxsplit=1)[0].strip()
             break
     if not name:
         name = os.path.basename(agent_dir)
