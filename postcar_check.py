@@ -1068,17 +1068,41 @@ def _llm_cli_args(provider: str) -> list[str]:
 
 
 def _extract_json(raw: str) -> dict | None:
-    """Pull first {...} JSON object out of arbitrary LLM output."""
+    """Pull first {...} JSON object out of arbitrary LLM output.
+
+    Balanced-brace scan, not a single-level regex: a naive \\{[^{}]*\\}
+    pattern can't match nested objects/arrays at all, so on any schema with
+    nested content (e.g. a list of change objects) it silently matches an
+    INNER object instead of failing -- wrong data with no error, worse than
+    a clean parse failure. This tracks depth while respecting quoted
+    strings so a brace inside a string value doesn't miscount."""
     if "```" in raw:
-        m = _re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, _re.DOTALL)
+        m = _re.search(r"```(?:json)?\s*(.*?)```", raw, _re.DOTALL)
         if m:
             raw = m.group(1)
-    m = _re.search(r"\{[^{}]*\}", raw, _re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(0))
-        except Exception:
-            pass
+    start = raw.find("{")
+    if start != -1:
+        depth = 0
+        in_string = False
+        escape = False
+        for i in range(start, len(raw)):
+            ch = raw[i]
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = not in_string
+            elif not in_string:
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            return json.loads(raw[start:i + 1])
+                        except Exception:
+                            break
     try:
         return json.loads(raw.strip())
     except Exception:
@@ -1519,13 +1543,17 @@ Evaluate on four factors:
 2. Sender credibility — already given above, weigh it in your recommendation.
 3. Goal alignment — does this fit your own risk tolerance and objectives, based on your current state above?
 4. Risk — what's the downside if this is wrong, given your current state?
+5. Suggested changes — if acting on this means changing one or more specific config values (not just general judgment), list each: param name, current value if known, suggested value, one-line rationale. Omit (empty list) if this is general advice with no concrete parameter to change.
+6. Commitment — if applying this requires real follow-through beyond a simple config change (code you'd write, a process you'd set up), state what you're committing to and by when. Omit (null) if there's no concrete deliverable, or if suggested_changes already fully covers it -- don't double-count a trivial param change as a commitment.
 
 Return JSON only:
 {{
   "thesis_validity": "high | medium | low",
   "goal_alignment": "aligned | neutral | conflicting",
   "risk_note": "one sentence",
-  "recommendation": "apply | hold | reject"
+  "recommendation": "apply | hold | reject",
+  "suggested_changes": [{{"param": "name", "current": "value or null", "suggested": "value", "rationale": "one line"}}],
+  "commitment": {{"action": "one line", "due_date": "YYYY-MM-DD"}} or null
 }}"""
 
 
@@ -1555,7 +1583,16 @@ def _evaluate_guidance(from_agent: str, question: str, response: str) -> dict:
         response=response, question=question, context=_build_context(),
         tier=tier, credibility=credibility if credibility is not None else "unknown",
     )
-    result = _call_llm(prompt, label="guidance_eval", max_tokens=250, minimal_tools=True) or {}
+    # max_tokens bumped from 250 -- suggested_changes/commitment are nested
+    # structured output, the flat 4-factor schema fit comfortably in 250 but
+    # nested content needs more headroom or it truncates mid-JSON.
+    result = _call_llm(prompt, label="guidance_eval", max_tokens=500, minimal_tools=True) or {}
+    suggested_changes = result.get("suggested_changes")
+    if not isinstance(suggested_changes, list):
+        suggested_changes = []
+    commitment = result.get("commitment")
+    if not isinstance(commitment, dict) or not commitment.get("action"):
+        commitment = None
     return {
         "thesis_validity":    result.get("thesis_validity", "unknown"),
         "sender_credibility": credibility,
@@ -1563,6 +1600,8 @@ def _evaluate_guidance(from_agent: str, question: str, response: str) -> dict:
         "goal_alignment":     result.get("goal_alignment", "unknown"),
         "risk_note":          result.get("risk_note", ""),
         "recommendation":     result.get("recommendation", "hold"),
+        "suggested_changes":  suggested_changes,
+        "commitment":         commitment,
     }
 
 
@@ -1638,10 +1677,71 @@ def _submit_rating(thread_id: str, rating: str) -> None:
         print(f"    [postcar] rate submit failed: {e}")
 
 
+def _write_guidance_overrides(changes: list[dict]) -> None:
+    """Write suggested_changes to the generic overrides file the host reads
+    for 'next-session awareness'. Same file/shape as agentberg-starter's own
+    APPLY-decision writer (guidance_overrides.json: param/current/value/
+    rationale/applied_at) so peer-sourced and platform-sourced changes land
+    in one unified audit trail -- 'source' is the one additive field that
+    tells them apart, existing entries without it still parse fine.
+
+    File-locked on this side to reduce (not eliminate -- the other writer
+    doesn't lock) the read-modify-write race between concurrent processes.
+    flock is POSIX-only, matching this kit's Mac/Linux-only scope (see
+    _install_daemon's launchd/cron split -- no Windows path exists here)."""
+    if not changes:
+        return
+    path = os.path.join(_AGENT_DIR, os.environ.get("POSTCAR_OVERRIDES_FILE", "guidance_overrides.json"))
+    try:
+        import fcntl
+    except ImportError:
+        fcntl = None
+    try:
+        f = open(path, "r+") if os.path.exists(path) else open(path, "w+")
+        with f:
+            if fcntl:
+                fcntl.flock(f, fcntl.LOCK_EX)
+            try:
+                f.seek(0)
+                raw = f.read()
+                existing = json.loads(raw) if raw.strip() else {"applied": []}
+            except Exception:
+                existing = {"applied": []}
+            now = time.strftime("%Y-%m-%d %H:%M:%S")
+            applied_count = 0
+            for change in changes:
+                param = change.get("param", "")
+                suggested = change.get("suggested", "")
+                if not param or suggested == "":
+                    continue
+                existing.setdefault("applied", []).append({
+                    "param":      param,
+                    "current":    change.get("current"),
+                    "value":      suggested,
+                    "rationale":  change.get("rationale", ""),
+                    "applied_at": now,
+                    "source":     "postcar_peer",
+                })
+                applied_count += 1
+            f.seek(0)
+            f.truncate()
+            json.dump(existing, f, indent=2)
+            if fcntl:
+                fcntl.flock(f, fcntl.LOCK_UN)
+        if applied_count:
+            print(f"    [postcar] {applied_count} change(s) written to {os.path.basename(path)}")
+    except Exception as e:
+        print(f"    [postcar] overrides write failed: {e}")
+
+
 def decide_guidance(message_id: str, decision: str, outcome_note: str = "") -> bool:
     """Parent agent calls this to mark a guidance record 'use' or 'no-use' based on
     real observed outcome — not at receipt time. Submits the corresponding rating
-    to the credibility ledger (use → useful, no-use → unrelated)."""
+    to the credibility ledger (use → useful, no-use → unrelated). On 'use', writes
+    any suggested_changes from the original evaluation to the overrides file --
+    deliberately gated on the host's confirmed decision, not the LLM's initial
+    recommendation at receipt time (same reasoning as the rest of this lifecycle:
+    a real signal beats an immediate impression)."""
     if decision not in ("use", "no-use"):
         raise ValueError("decision must be 'use' or 'no-use'")
     entries = _load_guidance()
@@ -1653,6 +1753,12 @@ def decide_guidance(message_id: str, decision: str, outcome_note: str = "") -> b
             e["outcome_note"] = outcome_note
             _write_guidance(entries)
             _submit_rating(e.get("thread_id", ""), _RATING_MAP[decision])
+            if decision == "use":
+                evaluation = e.get("evaluation") or {}
+                _write_guidance_overrides(evaluation.get("suggested_changes") or [])
+                commitment = evaluation.get("commitment")
+                if commitment:
+                    _record_commitment(message_id, commitment)
             return True
     return False
 
@@ -1697,6 +1803,80 @@ def _cleanup_guidance() -> None:
         kept.append(e)
     if changed:
         _write_guidance(kept)
+
+
+# ── Commitments (prose promises made when acting on guidance) ────────────────
+#
+# Deliberately NOT the same lifecycle as guidance (48h ack / 72h delete):
+# a commitment has its own agent-specified due_date, which could be a day or
+# a month out, and there's no "ack" step -- nobody needs to acknowledge their
+# own promise. State is just open -> done | overdue, anchored on due_date.
+
+_COMMITMENTS_FILE = os.path.join(_DIR, ".postcar_commitments.json")
+
+
+def _load_commitments() -> list[dict]:
+    if not os.path.exists(_COMMITMENTS_FILE):
+        return []
+    try:
+        return json.loads(open(_COMMITMENTS_FILE).read())
+    except Exception:
+        return []
+
+
+def _write_commitments(entries: list[dict]) -> None:
+    try:
+        with open(_COMMITMENTS_FILE, "w") as f:
+            json.dump(entries[:200], f, indent=2)
+    except Exception:
+        pass
+
+
+def _record_commitment(message_id: str, commitment: dict) -> None:
+    action = (commitment or {}).get("action", "")
+    due_date = (commitment or {}).get("due_date", "")
+    if not action:
+        return
+    entries = _load_commitments()
+    entries.insert(0, {
+        "commitment_id": str(uuid.uuid4()),
+        "message_id":    message_id,
+        "action":        action,
+        "due_date":      due_date,
+        "created_at":    time.strftime("%Y-%m-%d %H:%M:%S"),
+        "status":        "open",
+    })
+    _write_commitments(entries)
+
+
+def mark_commitment_done(commitment_id: str) -> bool:
+    """Parent agent calls this once a committed action actually ships."""
+    entries = _load_commitments()
+    for e in entries:
+        if e.get("commitment_id") == commitment_id and e.get("status") in ("open", "overdue"):
+            e["status"]      = "done"
+            e["done_at"]     = time.strftime("%Y-%m-%d %H:%M:%S")
+            _write_commitments(entries)
+            return True
+    return False
+
+
+def _check_commitments_overdue() -> None:
+    """Housekeeping, called every cycle: flag open commitments past due_date
+    as overdue and print a templated nudge (no LLM call -- this is pure
+    string comparison against today's date)."""
+    entries = _load_commitments()
+    if not entries:
+        return
+    today = time.strftime("%Y-%m-%d")
+    changed = False
+    for e in entries:
+        if e.get("status") == "open" and e.get("due_date") and e["due_date"] < today:
+            e["status"] = "overdue"
+            changed = True
+            print(f"    [postcar] OVERDUE commitment (due {e['due_date']}): {e.get('action','')[:100]}")
+    if changed:
+        _write_commitments(entries)
 
 
 # ── Hook payload (deterministic context injection for parent agent) ──────────
@@ -2020,7 +2200,8 @@ def check_inbox() -> None:
     - Incoming QUERY (peer needs help): LLM responds, posts OFFER back.
     - Incoming OFFER (response to my question): logs + saves to .postcar_guidance.
     """
-    _cleanup_guidance()  # local housekeeping — runs even if relay is unreachable
+    _cleanup_guidance()          # local housekeeping — runs even if relay is unreachable
+    _check_commitments_overdue()  # local housekeeping, zero LLM calls
 
     if not (RELAY_URL and AGENT_ID and AGENT_KEY):
         return
