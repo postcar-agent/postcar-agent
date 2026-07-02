@@ -1481,7 +1481,7 @@ def _llm_respond(question: str, capability: str, urgency: str, thread_id: str = 
         urgency=urgency, context=context,
         history=history or "(no prior messages in this thread)",
     )
-    return _call_llm(prompt, label="respond", max_tokens=200)
+    return _call_llm(prompt, label="respond", max_tokens=200, minimal_tools=True)
 
 
 # ── Guidance lifecycle (pending → acked → use/no-use/expired) ────────────────
@@ -2081,7 +2081,7 @@ def check_inbox() -> None:
                 f"Complete the task and return a JSON object with a 'result' key "
                 f"containing your answer and a 'confidence' key (low|medium|high)."
             )
-            llm_result = _ask_llm_raw(task_prompt)
+            llm_result = _ask_llm_raw(task_prompt, minimal_tools=True)
             if not llm_result:
                 llm_result = {"result": "Unable to complete task — LLM unavailable.", "confidence": "low"}
             # Send result (pipeline-aware)
