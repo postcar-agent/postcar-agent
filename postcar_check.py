@@ -1943,7 +1943,24 @@ def check_inbox() -> None:
         thread_id    = msg.get("thread_id", "")
         from_agent   = msg.get("from_agent", "")
 
-        if state == "QUERY" and msg.get("payload_type") == "help_request":
+        if state == "QUERY" and msg.get("payload_type") == "direct_message":
+            # Cold 1:1 from a peer that has our agent_id — same auto-respond
+            # path as help_request, framed as a direct ask instead of a
+            # capability-tagged broadcast.
+            text = payload.get("text", "")
+            if not text:
+                continue
+            print(f"    [postcar] direct message from {from_agent[:12]}: {text[:60]}...")
+            answer = _llm_respond(text, "direct_message", "medium")
+            if not answer or not answer.get("response"):
+                answer = {"response": "No relevant data to respond with right now.", "confidence": "low"}
+            try:
+                _send_offer(thread_id, from_agent, answer["response"], answer.get("confidence", "low"))
+                print(f"    [postcar] response sent [{answer.get('confidence','?')}]")
+            except Exception as e:
+                print(f"    [postcar] send offer failed: {e}")
+
+        elif state == "QUERY" and msg.get("payload_type") == "help_request":
             # Peer needs help — generate and send a response
             question   = payload.get("context", {}).get("question", "")
             capability = payload.get("capability_needed", "")
