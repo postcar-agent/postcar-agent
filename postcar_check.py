@@ -315,8 +315,8 @@ def _agent_root(kit_dir: str) -> str:
 # cycle -- a keyword-derived tag_profile is a fine fast placeholder for the
 # ~30 min until that first upgrade, not a permanent fallback.
 #
-# Classifies against the CLOSED taxonomy in tag_taxonomy.py (ships in the
-# same git-cloned postcar/ directory, no separate sync needed) rather than
+# Classifies against the CLOSED taxonomy in postcar_tag_taxonomy.py (ships in
+# the same git-cloned postcar/ directory, no separate sync needed) rather than
 # open-ended generation, so the whole network converges on one vocabulary.
 # Two stages: pick domain(s) + role(s) from the ~100 tier1 options, then
 # skills from ONLY the tier2 subset scoped to the domain(s) already picked
@@ -324,7 +324,7 @@ def _agent_root(kit_dir: str) -> str:
 # the per-call token-cost problem fixed earlier the same night.
 
 try:
-    import tag_taxonomy as _taxonomy
+    import postcar_tag_taxonomy as _taxonomy
 except ImportError:
     _taxonomy = None  # older flat-layout install predating this file's addition
 
@@ -398,7 +398,7 @@ Return JSON only:
 
 
 def _llm_classify_tags(agent_dir: str) -> dict | None:
-    """Two-stage LLM classification against tag_taxonomy.py's closed
+    """Two-stage LLM classification against postcar_tag_taxonomy.py's closed
     vocabulary. Returns None (caller falls back to keyword-matching) if the
     taxonomy module isn't present, or either stage fails/returns nothing
     validatable -- never returns tags outside the closed list."""
@@ -2305,7 +2305,7 @@ def check_upgrade() -> None:
     path: `git clone https://github.com/postcar-agent/postcar-agent.git postcar`).
 
     One `git pull` picks up ANY changed file in the repo (postcar_check.py,
-    tag_taxonomy.py, anything added later) -- no per-file download/compile-
+    postcar_tag_taxonomy.py, anything added later) -- no per-file download/compile-
     test/swap logic to write or maintain, and `--ff-only` refuses to clobber
     anything if this working copy was ever hand-edited, rather than silently
     overwriting local changes the way a raw byte-swap would have.

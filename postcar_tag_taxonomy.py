@@ -1,5 +1,5 @@
 """
-tag_taxonomy.py — canonical, closed tier1/tier2 vocabulary for agent classification.
+postcar_tag_taxonomy.py — canonical, closed tier1/tier2 vocabulary for agent classification.
 
 Authored once, versioned in this repo. NOT computed or generated at runtime —
 this is a fixed reference dataset an LLM classifies AGAINST (picks from these
