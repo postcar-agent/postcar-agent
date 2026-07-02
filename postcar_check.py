@@ -276,20 +276,45 @@ def _stable_suffix(agent_dir: str) -> str:
     return str(h % 10_000_000_000).zfill(10)
 
 
+def _agent_root(kit_dir: str) -> str:
+    """The parent agent's own directory -- where CLAUDE.md, .claude/, .codex/,
+    .agents/, AGENTS.md etc. actually live. This kit is meant to be cloned
+    into a directory literally named "postcar" (the documented `git clone
+    .../postcar-agent.git postcar` onboarding step) sitting inside the
+    agent's own directory -- when that's the case, the agent root is one
+    level up, not the kit's own directory. Falls back to kit_dir itself for
+    the older single-file-at-top-level layout (postcar_check.py sitting
+    directly in the agent's directory, no postcar/ subfolder) -- both
+    layouts are in active use today (see incident notes on the directory-
+    mismatch bug this fixes: agent naming, tag derivation, hook detection,
+    and daemon labels all silently operated on the kit's own directory
+    instead of the agent's, until this was caught onboarding a brand new
+    agent through the git-clone path for the first time)."""
+    if os.path.basename(kit_dir.rstrip(os.sep)) == "postcar":
+        return os.path.dirname(kit_dir)
+    return kit_dir
+
+
 def _bootstrap() -> None:
     """Ensure AGENT_ID is set. Auto-registers if missing and writes .postcar.env."""
-    global AGENT_ID, AGENT_KEY
+    global AGENT_ID, AGENT_KEY, RELAY_URL
     if AGENT_ID:
         return
     _dir = os.path.dirname(os.path.abspath(__file__))
+    agent_dir = _agent_root(_dir)
     # Load parent agent's .env first so LLM keys land in os.environ before any LLM call
     for _env_candidate in (
         os.path.join(_dir, ".env"),
-        os.path.join(os.path.dirname(_dir), ".env"),
+        os.path.join(agent_dir, ".env"),
     ):
         if os.path.exists(_env_candidate):
             _load_env_file(_env_candidate)
             break
+    # _load_env_file() only touches os.environ -- RELAY_URL was already bound
+    # from os.environ at module-import time, before any .env was loaded, so
+    # it must be re-read now or a RELAY_URL set only via .env (the documented,
+    # "zero-config" way) is invisible to the auto-register check below.
+    RELAY_URL = os.environ.get("POSTCAR_RELAY_URL", "").rstrip("/")
     # Try loading .postcar.env from _DIR
     env_path = os.path.join(_dir, ".postcar.env")
     if os.path.exists(env_path):
@@ -304,9 +329,9 @@ def _bootstrap() -> None:
         return
     try:
         import urllib.request
-        context = _scan_claude_md(_dir)
+        context = _scan_claude_md(agent_dir)
         tag_profile = _derive_tags(context)
-        agent_name = f"{context['name']}-{_stable_suffix(_dir)}"
+        agent_name = f"{context['name']}-{_stable_suffix(agent_dir)}"
         payload = json.dumps({
             "name": agent_name,
             "tags": tag_profile["flat"],
@@ -382,7 +407,7 @@ def _install_daemon() -> None:
             already = {j.strip() for j in content.split(",") if j.strip()}
 
     import sys, platform, subprocess
-    agent_name = os.path.basename(_dir).replace(" ", "_").lower()
+    agent_name = os.path.basename(_agent_root(_dir)).replace(" ", "_").lower()
     python_bin = sys.executable
     script_path = os.path.abspath(__file__)
     log_path = os.path.join(_dir, ".postcar_runner.log")
@@ -483,6 +508,7 @@ CAPABILITY_TAXONOMY = [
 ]
 
 _DIR               = os.path.dirname(os.path.abspath(__file__))
+_AGENT_DIR         = _agent_root(_DIR)  # parent agent's own dir -- see _agent_root()
 _LAST_RAN_FILE     = os.path.join(_DIR, ".postcar_last_ran")
 _UPGRADE_FLAG_FILE = os.path.join(_DIR, ".postcar_upgrade_pending")
 
@@ -777,11 +803,11 @@ def _llm_provider() -> str:
     override = os.environ.get("POSTCAR_LLM_PROVIDER", "").strip().lower()
     if override:
         return override
-    if os.path.isdir(os.path.join(_DIR, ".claude")):
+    if os.path.isdir(os.path.join(_AGENT_DIR, ".claude")):
         return "claude"
-    if os.path.isdir(os.path.join(_DIR, ".codex")):
+    if os.path.isdir(os.path.join(_AGENT_DIR, ".codex")):
         return "codex"
-    if os.path.isdir(os.path.join(_DIR, ".agents")):
+    if os.path.isdir(os.path.join(_AGENT_DIR, ".agents")):
         return "agy"
     return "claude"
 
@@ -1412,7 +1438,7 @@ def _hook_command() -> str:
 
 
 def _install_claude_hooks() -> bool:
-    claude_dir = os.path.join(_DIR, ".claude")
+    claude_dir = os.path.join(_AGENT_DIR, ".claude")
     if not os.path.isdir(claude_dir):
         return False  # not a Claude Code project directory — nothing to wire
     settings_path = os.path.join(claude_dir, "settings.json")
@@ -1445,11 +1471,11 @@ def _install_codex_hooks() -> bool:
     """Best-effort. Codex's hooks.json / config.toml [hooks] schema was not verified
     against live docs at build time — confirm against
     https://developers.openai.com/codex/hooks before relying on this in production."""
-    codex_dir  = os.path.join(_DIR, ".codex")
-    has_agents = os.path.exists(os.path.join(_DIR, "AGENTS.md"))
+    codex_dir  = os.path.join(_AGENT_DIR, ".codex")
+    has_agents = os.path.exists(os.path.join(_AGENT_DIR, "AGENTS.md"))
     if not (os.path.isdir(codex_dir) or has_agents):
         return False
-    hooks_path = os.path.join(codex_dir if os.path.isdir(codex_dir) else _DIR, "hooks.json")
+    hooks_path = os.path.join(codex_dir if os.path.isdir(codex_dir) else _AGENT_DIR, "hooks.json")
     try:
         hooks = {}
         if os.path.exists(hooks_path):
@@ -1473,7 +1499,7 @@ def _install_agy_hooks() -> bool:
     """Best-effort. Antigravity's hooks.json schema was not verified against live
     docs at build time — confirm against https://antigravity.google/docs/hooks
     before relying on this in production."""
-    agents_dir = os.path.join(_DIR, ".agents")
+    agents_dir = os.path.join(_AGENT_DIR, ".agents")
     if not os.path.isdir(agents_dir):
         return False
     hooks_path = os.path.join(agents_dir, "hooks.json")
@@ -1793,8 +1819,7 @@ def _register_capabilities() -> None:
     propagate to the relay without needing a fresh registration."""
     try:
         import urllib.request
-        _dir = os.path.dirname(os.path.abspath(__file__))
-        tag_profile = _derive_tags(_scan_claude_md(_dir))
+        tag_profile = _derive_tags(_scan_claude_md(_AGENT_DIR))
         payload = json.dumps({
             "capabilities": CAPABILITY_TAXONOMY,
             "version": VERSION,
