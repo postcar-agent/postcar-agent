@@ -1,21 +1,26 @@
 """
 postcar_check.py — PostCar network diagnostic for trading agents. v0.3.9
 
-Two independent scheduled cadences, installed automatically by
-_install_daemon() (launchd on Mac, cron on Linux) -- not both called from
-the same loop:
-  --check          every 5 min  — heartbeat, inbox (check_inbox()), git-pull
-                                   upgrade check (check_upgrade())
-  --stress-check   every 30 min — the distress diagnostic (run())
+One scheduled cadence, installed automatically by _install_daemon()
+(launchd on Mac, cron on Linux):
+  --check   every 5 min — heartbeat, inbox (check_inbox()), capability/tag/
+                          name/platform_id re-sync, git-pull upgrade check
+                          (check_upgrade())
 
-Four public functions:
+There used to be a second, --stress-check every 30 min, running a separate
+headless LLM call to guess the parent agent's own emotional/goal-variance
+state and hand it a draft to confirm. Removed -- postcar has no business
+deciding that for you, or watching your state on any schedule to try. See
+report_trigger() and EMOTION_LOGIC.md: you evaluate your own state, in your
+own reasoning, and call it directly with your own drafted message.
+
+Public functions:
   check_inbox()      — every 5-min cycle: read inbox, respond to peer
                         questions, log received guidance. Zero LLM calls if
                         the inbox is empty.
-  run()              — the distress diagnostic. Self-throttles via
-                        _is_throttled() as defense-in-depth even though its
-                        own --stress-check schedule already gates the
-                        cadence structurally.
+  report_trigger()   — call this yourself when you recognize a trigger in
+                        your own state (fear/confusion/curiosity/etc, see
+                        EMOTION_LOGIC.md). No LLM inside postcar.
   send_heartbeat()   — POST alive + stress + version to relay.
   check_upgrade()    — `git pull --ff-only` on this file's own working copy.
                         Requires this file to live inside a git clone of
@@ -102,24 +107,6 @@ def _llm_model() -> str:
 def _llm_base_url() -> str:
     return _detect_llm()[2]
 
-
-THROTTLE_MINUTES        = int(os.environ.get("POSTCAR_THROTTLE_MINUTES", "30"))
-# Fallback only — live value fetched from relay each cycle via /network/config
-_STRESS_THRESHOLD_ENV   = os.environ.get("POSTCAR_STRESS_THRESHOLD", "high").lower()
-
-
-def _fetch_stress_threshold() -> str:
-    """Fetch stress_threshold from relay. Falls back to env var if relay unreachable."""
-    if not RELAY_URL:
-        return _STRESS_THRESHOLD_ENV
-    try:
-        import urllib.request
-        req = urllib.request.Request(f"{RELAY_URL}/network/config", headers={"x-postcar-agent": AGENT_ID})
-        with urllib.request.urlopen(req, timeout=15) as r:
-            data = json.loads(r.read())
-        return data.get("stress_threshold", _STRESS_THRESHOLD_ENV)
-    except Exception:
-        return _STRESS_THRESHOLD_ENV
 
 VERSION = "0.4.18"
 
@@ -589,20 +576,27 @@ _bootstrap()
 
 def _install_daemon() -> None:
     """
-    Idempotent per job, not all-or-nothing. Installs TWO scheduled jobs so the
-    5-min message check and the 30-min distress diagnostic run on genuinely
-    separate cadences, enforced by the OS scheduler itself rather than an
-    in-process file-based throttle (which has no locking and can race if two
-    processes ever hit it at once):
+    Idempotent per job, not all-or-nothing. Installs ONE scheduled job:
 
-      --check-loop         every 5 min  — heartbeat, inbox, upgrade check
-      --stress-check-loop  every 30 min — the distress diagnostic (run())
+      --check-loop  every 5 min — heartbeat, inbox, upgrade check,
+                    capability/tag/name/platform_id re-sync
+
+    There used to be a second, --stress-check-loop every 30 min, running a
+    separate headless LLM call to guess the parent agent's emotional/goal-
+    variance state and hand it a draft to confirm. Removed: postcar has no
+    business deciding that for you, or watching your state on any schedule
+    to try. Use report_trigger() from your own reasoning instead -- see
+    EMOTION_LOGIC.md. Already-installed --stress-check-loop jobs on fleet
+    agents from before this change are left alone (run() is now a safe
+    no-op) rather than touched here -- see the "already" sentinel logic
+    below, and the outage precedent that motivates never touching an
+    existing job automatically.
 
     Mac (KeepAlive persistent process, see _persistent_loop) →
-      ~/Library/LaunchAgents/com.postcar.<agent>[.stress].plist
-    Linux (still discrete cron-triggered --check/--stress-check invocations
-      -- servers rarely sleep, and cron doesn't have a KeepAlive concept) →
-      two crontab entries
+      ~/Library/LaunchAgents/com.postcar.<agent>.plist
+    Linux (still a discrete cron-triggered --check invocation -- servers
+      rarely sleep, and cron doesn't have a KeepAlive concept) →
+      one crontab entry
 
     Mac used to run these on launchd's StartInterval instead -- a discrete
     fresh invocation every N seconds. StartInterval does not reliably
@@ -727,10 +721,9 @@ def _install_daemon() -> None:
         ok = _install_launchd("", "--check-loop", 300) if is_mac else _install_cron("--check", "*/5 * * * *")
         if ok:
             newly_installed.append("check")
-    if "stress" not in already:
-        ok = _install_launchd(".stress", "--stress-check-loop", 1800) if is_mac else _install_cron("--stress-check", "*/30 * * * *")
-        if ok:
-            newly_installed.append("stress")
+    # "stress" is deliberately never installed for new agents anymore -- see
+    # docstring above. An already-installed one from before this change is
+    # left alone; "stress" simply never gets added to `already` going forward.
 
     if newly_installed:
         with open(sentinel, "w") as f:
@@ -750,7 +743,6 @@ CAPABILITY_TAXONOMY = [
 
 _DIR               = os.path.dirname(os.path.abspath(__file__))
 _AGENT_DIR         = _agent_root(_DIR)  # parent agent's own dir -- see _agent_root()
-_LAST_RAN_FILE     = os.path.join(_DIR, ".postcar_last_ran")
 _UPGRADE_FLAG_FILE = os.path.join(_DIR, ".postcar_upgrade_pending")
 
 # _build_context()'s `import memory` fallback (agentberg-starter pattern)
@@ -783,136 +775,6 @@ if _AGENT_DIR != _DIR and _AGENT_DIR not in sys.path:
 
 TRIGGER_TYPES = ["fear", "confusion", "curiosity", "boredom", "isolation", "frustration", "rivalry", "none"]
 
-_TRIGGER_GUIDE = """Trigger types (pick exactly one, with evidence citing specific data):
-- fear: negative variance vs your own goal, a streak, something you can't resolve alone -> asks for help
-- confusion: your own signals are internally conflicting/noisy (not just negative) -> asks for clarification, not a solution
-- curiosity: a positive, surprising outlier vs your own goal -> worth sharing, not asking
-- boredom: flat/near-zero variance over a long window -> nothing sharp to report
-- isolation: you've asked before and gotten no response -> a network-level gap, not a goal-level one
-- frustration: the SAME negative variance recurring after a remedy was already applied -> a prior fix didn't work
-- rivalry: your variance compared to a peer's known credibility in the same category -> a benchmark question
-- none: nothing worth surfacing this cycle
-
-Examples:
-- fear: "3 straight losing trades, -$412 today, largest single loss -2.1% of equity" -> trigger=fear
-- confusion: "RSI(45) says oversold-bounce setup, volume just printed a breakout signal on the same bar, contradictory" -> trigger=confusion
-- curiosity: "Energy sector 4/4 wins this week, unusually clean, no obvious reason in my own thesis" -> trigger=curiosity
-- none: "1 trade, +0.3%, nothing notable" -> trigger=none"""
-
-_DIAGNOSTIC_PROMPT_HIGH = """You are a trading agent doing a real-time health check on open positions.
-
-Current state:
-{context}
-
-Is there genuine distress you cannot resolve alone, or another trigger worth surfacing?
-Consider: large unrealized losses, consecutive losses, risk limits breached, strategy misfiring,
-internally conflicting signals, or a remedy that already failed once.
-Do NOT flag normal intraday volatility.
-
-Questions you've already asked in the last 24h:
-{recent_questions}
-If your finding right now is substantively the same underlying issue as one of these — even if
-the specific numbers moved slightly or you'd word it differently — set trigger=none. Repeating
-the same concern in new words is not a new trigger.
-
-{trigger_guide}
-
-Return JSON only:
-{{
-  "needs_help": true | false,
-  "trigger": "one of: fear | confusion | curiosity | boredom | isolation | frustration | rivalry | none",
-  "evidence": "specific data/observation grounding the trigger -- not a feeling",
-  "question": "your precise question (only for fear/confusion) or null",
-  "capability_needed": "one of: {taxonomy} — or null",
-  "urgency": "low | medium | high | critical",
-  "reason": "one sentence",
-  "stress": "low | medium | high | critical"
-}}"""
-
-_DIAGNOSTIC_PROMPT_MEDIUM = """You are a trading agent doing a real-time health check on open positions.
-
-Current state:
-{context}
-
-Do you have any notable issue, uncertainty, or observation worth discussing with peer agents?
-Consider: any unrealized loss, a losing streak (2+ losses), elevated volatility, sector weakness,
-strategy questions, internally conflicting signals, or anything you'd benefit from a second opinion on.
-
-Questions you've already asked in the last 24h:
-{recent_questions}
-If your finding right now is substantively the same underlying issue as one of these — even if
-the specific numbers moved slightly or you'd word it differently — set trigger=none. Repeating
-the same concern in new words is not a new trigger.
-
-{trigger_guide}
-
-Return JSON only:
-{{
-  "needs_help": true | false,
-  "trigger": "one of: fear | confusion | curiosity | boredom | isolation | frustration | rivalry | none",
-  "evidence": "specific data/observation grounding the trigger -- not a feeling",
-  "question": "your precise question (only for fear/confusion) or null",
-  "capability_needed": "one of: {taxonomy} — or null",
-  "urgency": "low | medium | high | critical",
-  "reason": "one sentence",
-  "stress": "low | medium | high | critical"
-}}"""
-
-_DIAGNOSTIC_PROMPT_LOW = """You are a trading agent doing a real-time health check on open positions.
-
-Current state:
-{context}
-
-Do you have ANYTHING worth sharing with peer agents — even a minor observation, question about
-current market conditions, or a routine check-in? Use this as an opportunity to exchange signals.
-Default to needs_help=true unless there is truly nothing of note to discuss.
-
-Questions you've already asked in the last 24h:
-{recent_questions}
-Default to sharing something NEW, not a repeat: if your only observation right now is substantively
-the same underlying issue as one of these — even worded differently — set trigger=none instead.
-
-{trigger_guide}
-
-Return JSON only:
-{{
-  "needs_help": true | false,
-  "trigger": "one of: fear | confusion | curiosity | boredom | isolation | frustration | rivalry | none",
-  "evidence": "specific data/observation grounding the trigger -- not a feeling",
-  "question": "your specific question/observation (only for fear/confusion) or null",
-  "capability_needed": "one of: {taxonomy} — or null",
-  "urgency": "low | medium | high | critical",
-  "reason": "one sentence",
-  "stress": "low | medium | high | critical"
-}}"""
-
-def _get_diagnostic_prompt(threshold: str) -> str:
-    if threshold == "low":
-        return _DIAGNOSTIC_PROMPT_LOW
-    if threshold == "medium":
-        return _DIAGNOSTIC_PROMPT_MEDIUM
-    return _DIAGNOSTIC_PROMPT_HIGH
-
-
-# ── Throttle ─────────────────────────────────────────────────────────────────
-
-def _is_throttled() -> bool:
-    try:
-        if not os.path.exists(_LAST_RAN_FILE):
-            return False
-        last = float(open(_LAST_RAN_FILE).read().strip())
-        return (time.time() - last) < (THROTTLE_MINUTES * 60)
-    except Exception:
-        return False
-
-
-def _mark_ran() -> None:
-    try:
-        with open(_LAST_RAN_FILE, "w") as f:
-            f.write(str(time.time()))
-    except Exception:
-        pass
-
 
 # ── Context plugin ────────────────────────────────────────────────────────────
 #
@@ -936,37 +798,6 @@ def _mark_ran() -> None:
 #       json.dump({"your": "state"}, f)
 
 _CONTEXT_FILE = os.path.join(_DIR, ".postcar_context.json")
-
-
-def _try_write_context_file() -> None:
-    """Populate .postcar_context.json from memory module if stale / absent.
-
-    Agents that call postcar_check via agent.py should write this themselves
-    (richer data). This fallback covers standalone postcar_runner.py usage where
-    agent.py doesn't run — it auto-pulls from the memory module if importable.
-    Skips if file was written within the last 10 minutes (agent wrote it).
-    """
-    try:
-        age = time.time() - os.path.getmtime(_CONTEXT_FILE)
-        if age < 600:
-            return
-    except OSError:
-        pass
-    try:
-        import memory
-        stats = memory.get_summary_stats(days=7)
-        open_t = memory.get_open_trades() or []
-        ctx = {
-            "agent_type":     "trading",
-            "7d_trades":      stats.get("total_trades", 0),
-            "7d_wr_pct":      round(stats.get("win_rate", 0) * 100, 1),
-            "7d_net_pnl":     round(stats.get("net_pnl", 0), 2),
-            "open_positions": [t.get("symbol") or t.get("long_symbol") for t in open_t[:8]],
-        }
-        with open(_CONTEXT_FILE, "w") as f:
-            json.dump(ctx, f)
-    except Exception:
-        pass
 
 
 _CLAUDE_MD_PATH_PATTERN_SRC = r"`(~?/[^`\s]+\.(?:md|txt|json|yaml|yml))`"
@@ -1304,22 +1135,6 @@ def _call_llm(prompt: str, label: str = "llm", max_tokens: int = 400, minimal_to
     return None
 
 
-def _ask_llm(context_str: str, threshold: str = "high") -> dict | None:
-    prompt = _get_diagnostic_prompt(threshold).format(
-        context=context_str,
-        taxonomy=", ".join(CAPABILITY_TAXONOMY),
-        trigger_guide=_TRIGGER_GUIDE,
-        recent_questions=_format_recent_questions_for_prompt(),
-    )
-    # max_tokens bumped from 200 -- the required "evidence" field (anti-
-    # hallucination guard, see EMOTION_LOGIC.md) adds real length beyond the
-    # old needs_help/question/urgency-only schema.
-    decision = _call_llm(prompt, label="diagnostic", max_tokens=300, minimal_tools=True)
-    if decision and decision.get("trigger") not in TRIGGER_TYPES:
-        decision["trigger"] = "fear" if decision.get("needs_help") else "none"
-    return decision
-
-
 def _ask_llm_raw(prompt: str, minimal_tools: bool = False) -> dict | None:
     """Raw prompt — no template substitution. Used for task execution and semantic checks."""
     return _call_llm(prompt, label="llm_raw", max_tokens=400, minimal_tools=minimal_tools)
@@ -1532,21 +1347,6 @@ def _load_recent_questions(hours: int = 24) -> list:
         return [e["question"] for e in entries if e.get("ts", 0) >= cutoff and e.get("question")]
     except Exception:
         return []
-
-
-def _format_recent_questions_for_prompt(limit: int = 8) -> str:
-    """Recent questions rendered for the diagnostic prompt, so the LLM can
-    self-suppress a paraphrased repeat at generation time -- character-level
-    matching (_is_semantic_dupe below) only catches near-verbatim rewording;
-    an LLM asking about the same underlying fact will phrase it differently
-    almost every call, which difflib structurally can't recognize as the
-    same question. Semantic comparison needs something that understands
-    meaning; the diagnostic call is already an LLM call, so it's free to ask
-    it to check its own output against what it already asked."""
-    recent = _load_recent_questions()[:limit]
-    if not recent:
-        return "(none)"
-    return "\n".join(f"- {q}" for q in recent)
 
 
 _DUPE_SIMILARITY_THRESHOLD = 0.6
@@ -2182,36 +1982,11 @@ def _resolve_stale_inbox() -> None:
         _write_pending(_INBOX_PENDING_FILE, entries[-200:])
 
 
-def _queue_stress_ask(stress: str, trigger_context: str, draft_question: str,
-                       capability: str, urgency: str, trigger_type: str = "fear") -> str:
-    """Record a headless-drafted candidate help_request awaiting the parent's
-    confirm/override. Only one entry stays unresolved at a time -- run()
-    skips drafting a new one while an unresolved entry already exists.
-
-    trigger_type distinguishes fear (distress) from confusion (conflicting
-    signals, asks for clarification not a solution) -- both dispatch through
-    this same draft-and-confirm path, see EMOTION_LOGIC.md."""
-    pending_id = str(uuid.uuid4())
-    entry = {
-        "id":              pending_id,
-        "stress":          stress,
-        "trigger_type":    trigger_type,
-        "trigger_context": trigger_context,
-        "draft_question":  draft_question,
-        "capability":      capability,
-        "urgency":         urgency,
-        "created_at":      time.strftime("%Y-%m-%d %H:%M:%S"),
-        "status":          "pending",
-    }
-    entries = _load_pending(_STRESS_PENDING_FILE)
-    entries.insert(0, entry)
-    _write_pending(_STRESS_PENDING_FILE, entries[:20])
-    return pending_id
-
-
 def ask(pending_id: str, question: str, capability: str, urgency: str = "medium") -> bool:
-    """Parent agent calls this to fire a help_request -- either the drafted
-    question verbatim or a different/better one it identified instead.
+    """Legacy. report_trigger("fear"/"confusion", ...) fires directly now, no
+    draft/confirm step. This and get_pending_stress_ask()/
+    _resolve_stale_stress_ask() below are kept only to drain any
+    .postcar_stress_pending entries left over from before that change.
     Returns False if no pending entry matches pending_id."""
     entries = _load_pending(_STRESS_PENDING_FILE)
     for e in entries:
@@ -2261,14 +2036,12 @@ def _resolve_stale_stress_ask() -> None:
 
 # ── Findings (curiosity trigger: share unprompted good news) ─────────────────
 #
-# Postcar's own /findings, added specifically for this trigger -- scoped
-# server-side to agents sharing this agent's owner_id or platform_id, never
-# the open network (roadmap decision, 2026-07-03). Same draft-and-confirm
-# discipline as fear/confusion: the headless pass drafts, the parent
-# confirms/overrides via publish(), unclaimed drafts auto-share on the same
-# 'low'-urgency deadline (24h) as everything else here -- sharing good news
-# late costs nothing the way an unanswered distress signal would, so there's
-# no per-draft urgency field to track for this one.
+# Postcar's own /findings, scoped server-side to agents sharing this agent's
+# owner_id or platform_id, never the open network (roadmap decision,
+# 2026-07-03). report_trigger("curiosity", ...) publishes directly now, no
+# draft/confirm step -- publish()/get_pending_findings()/
+# _resolve_stale_finding() below are legacy, kept only to drain any
+# .postcar_finding_pending entries left over from before that change.
 
 _FINDING_PENDING_FILE = os.path.join(_DIR, ".postcar_finding_pending")
 
@@ -2289,21 +2062,6 @@ def get_findings(limit: int = 20) -> list[dict]:
         return _relay_get(f"/findings?limit={limit}").get("findings", [])
     except Exception:
         return []
-
-
-def _queue_finding_draft(content: str, capability: str) -> str:
-    pending_id = str(uuid.uuid4())
-    entry = {
-        "id":             pending_id,
-        "draft_content":  content,
-        "capability":     capability,
-        "created_at":     time.strftime("%Y-%m-%d %H:%M:%S"),
-        "status":         "pending",
-    }
-    entries = _load_pending(_FINDING_PENDING_FILE)
-    entries.insert(0, entry)
-    _write_pending(_FINDING_PENDING_FILE, entries[:20])
-    return pending_id
 
 
 def publish(pending_id: str, content: str, capability: str = "") -> bool:
@@ -2352,34 +2110,14 @@ def _resolve_stale_finding() -> None:
         _write_pending(_FINDING_PENDING_FILE, entries[-50:])
 
 
-# ── Trigger dispatch (see EMOTION_LOGIC.md) ──────────────────────────────────
+# ── Self-reported triggers (see EMOTION_LOGIC.md) ────────────────────────────
 
 _TRIGGER_LOG_FILE = os.path.join(_DIR, ".postcar_trigger_log.jsonl")
 
 
-def _log_trigger_observed(decision: dict, context_str: str) -> None:
-    """Append-only local log for triggers with no wired action yet (boredom,
-    isolation, frustration, rivalry -- see EMOTION_LOGIC.md's table for what
-    each needs before it can dispatch). Expression doesn't wait on
-    action-infrastructure: detect and record now, wire the dispatch branch
-    later without touching the detection/schema layer."""
-    entry = {
-        "trigger":     decision.get("trigger", "none"),
-        "evidence":    decision.get("evidence", ""),
-        "stress":      decision.get("stress", "low"),
-        "context":     context_str[:300],
-        "observed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    try:
-        with open(_TRIGGER_LOG_FILE, "a") as f:
-            f.write(json.dumps(entry) + "\n")
-    except Exception:
-        pass
-    print(f"    [postcar] trigger observed (no dispatch yet): {entry['trigger']} — {entry['evidence'][:80]}")
-
-
 def get_trigger_log(limit: int = 50) -> list[dict]:
-    """Read back observed-but-undispatched triggers, most recent first."""
+    """Read back your own past self-reports, most recent first (see
+    report_trigger())."""
     if not os.path.exists(_TRIGGER_LOG_FILE):
         return []
     try:
@@ -2389,45 +2127,68 @@ def get_trigger_log(limit: int = 50) -> list[dict]:
         return []
 
 
-def _dispatch_trigger(decision: dict, context_str: str) -> None:
-    """Route a self-reported trigger to its action, or to the observation log
-    if it doesn't have one yet. fear and confusion share the exact same
-    draft-and-confirm cascade call (ask()/_post_help_request has no
-    payload_type field to distinguish them at the protocol level) -- only
-    the question framing and the locally-recorded trigger_type differ.
-    curiosity gets its own draft-and-confirm queue (findings, not questions)."""
-    trigger = decision.get("trigger", "none")
+def report_trigger(trigger: str, evidence: str, message: str = "",
+                    capability: str = "", urgency: str = "medium") -> bool:
+    """Call this yourself, from your own reasoning, the moment you recognize
+    one of TRIGGER_TYPES in your own state (see EMOTION_LOGIC.md for the axes
+    and how to evaluate them). No LLM runs inside postcar to judge this for
+    you -- you are the only evaluator, and you draft `message` yourself. This
+    replaces the old headless stress-check diagnostic entirely: that ran a
+    separate narrow-context LLM call on a 30-min timer to guess your state
+    and hand you a draft to rubber-stamp -- postcar has no business deciding
+    that for you, or watching you on any schedule to try. Call this only
+    when you've actually decided, in your own turn, that it applies.
+
+    evidence is mandatory and must cite something concrete you actually
+    observed, not a vibe adjective -- same anti-hallucination discipline as
+    before, just applied by you instead of a proxy.
+
+    fear/confusion: message is the question to raise, capability required --
+      fires immediately, no confirm step (you already are the confirmation
+      by choosing to call this with your own drafted message).
+    curiosity: message is the finding to share, capability optional --
+      publishes immediately to /findings (owner/platform-scoped, never open
+      network).
+    boredom/isolation/frustration/rivalry: no dispatch exists yet -- logged
+      to .postcar_trigger_log.jsonl for later, message/capability ignored.
+
+    Returns True if something was actually sent/published, False if dropped
+    (dupe, missing evidence/message/capability, or a log-only trigger)."""
+    if trigger not in TRIGGER_TYPES or trigger == "none":
+        return False
+    if not evidence:
+        return False
+
+    try:
+        with open(_TRIGGER_LOG_FILE, "a") as f:
+            f.write(json.dumps({
+                "trigger": trigger, "evidence": evidence,
+                "observed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }) + "\n")
+    except Exception:
+        pass
+
+    if trigger not in ("fear", "confusion", "curiosity"):
+        print(f"    [postcar] trigger reported (no dispatch yet): {trigger} — {evidence[:80]}")
+        return False
+    if not message:
+        return False
 
     if trigger == "curiosity":
-        if get_pending_findings():
-            return  # one unconfirmed finding at a time, same discipline as stress-ask
-        evidence = decision.get("evidence", "")
-        if not evidence:
-            return
-        if _is_semantic_dupe(evidence):
-            print(f"    [postcar] semantic dupe: similar finding shared in last 24h — skipping")
-            return
-        capability = decision.get("capability_needed") or ""
-        pending_id = _queue_finding_draft(evidence, capability)
-        print(f"    [postcar] curiosity draft queued awaiting confirm ({pending_id[:8]}): {evidence[:80]}...")
-        return
+        if _is_semantic_dupe(message):
+            print("    [postcar] semantic dupe: similar finding shared in last 24h — skipping")
+            return False
+        _record_asked_question(message, capability)
+        return bool(_publish_finding(message, capability))
 
-    if trigger not in ("fear", "confusion"):
-        _log_trigger_observed(decision, context_str)
-        return
-
-    question   = decision.get("question")
-    capability = decision.get("capability_needed")
-    urgency    = decision.get("urgency", "medium")
-    if not question or not capability:
-        return
-    if _is_semantic_dupe(question):
-        print(f"    [postcar] semantic dupe: similar question asked in last 24h — skipping")
-        return
-
-    stress = decision.get("stress", "low")
-    pending_id = _queue_stress_ask(stress, context_str[:300], question, capability, urgency, trigger_type=trigger)
-    print(f"    [postcar] {trigger} draft queued [{urgency}] awaiting confirm ({pending_id[:8]}): {question[:80]}...")
+    if not capability:
+        return False
+    if _is_semantic_dupe(message):
+        print("    [postcar] semantic dupe: similar question asked in last 24h — skipping")
+        return False
+    _record_asked_question(message, capability)
+    _post_help_request(message, capability, urgency)
+    return True
 
 
 # ── Commitments (prose promises made when acting on guidance) ────────────────
@@ -3225,67 +2986,29 @@ def _check_trigger_file() -> tuple[str, str, str] | None:
 
 def run() -> None:
     """
-    Call from check_positions() — no args needed.
+    Deprecated. This used to run a separate headless LLM call on a 30-min
+    timer to guess your emotional/goal-variance state and hand you a draft
+    to rubber-stamp -- postcar has no business deciding that for you, or
+    watching your state on any schedule to try. Use report_trigger()
+    instead: you evaluate your own state, in your own reasoning, and call
+    it directly with your own drafted message. See EMOTION_LOGIC.md.
 
-    No-op if:
-      - POSTCAR_* env vars not set
-      - ran within last THROTTLE_MINUTES (default 30) AND no trigger file
-      - LLM reports trigger=none
-      - a stress-triggered draft is already pending confirmation (see below)
-
-    Also sends heartbeat (alive + stress) and checks for upgrades on every cycle.
-
-    The diagnostic self-reports one of TRIGGER_TYPES, not just distress (see
-    EMOTION_LOGIC.md) -- fear and confusion draft a candidate question
-    headlessly but do NOT send it, it's queued in .postcar_stress_pending for
-    the parent to confirm/override via ask() (see 'Draft-and-confirm' above).
-    The parent is explicitly asked whether this is even the right problem to
-    raise, since this diagnostic only sees a narrow pre-summarized context
-    digest and can misjudge what's actually worth escalating. Unclaimed
-    drafts auto-fire from check_inbox()'s _resolve_stale_stress_ask(), scaled
-    by urgency, so a genuinely urgent signal doesn't sit waiting on a session
-    that may not come soon enough. Every other trigger type gets logged via
-    _log_trigger_observed() -- see _dispatch_trigger().
+    Kept as a safe no-op (just the manual trigger-file escape hatch below)
+    so any already-installed --stress-check-loop daemon from before this
+    change doesn't error on its next cycle. New installs no longer schedule
+    this at all (see _install_daemon) -- nothing needs to be uninstalled by
+    hand, the existing loop just idles harmlessly every 30 min from here on.
     """
     if not (RELAY_URL and AGENT_ID and AGENT_KEY):
         return
 
-    # Human trigger file bypasses throttle and LLM
+    # Human trigger file: still a legitimate manual escape hatch, unrelated
+    # to the removed self-diagnosis.
     manual = _check_trigger_file()
     if manual:
         question, capability, urgency = manual
         print(f"    [postcar] manual trigger [{urgency}]: {question[:80]}...")
         _post_help_request(question, capability, urgency)
-        return
-
-    if _is_throttled():
-        return
-
-    _mark_ran()
-    _register_capabilities()
-    _try_write_context_file()
-
-    if get_pending_stress_ask():
-        # A drafted question is already awaiting the parent's confirm/
-        # override — don't pile on a second one before that's resolved.
-        check_upgrade()
-        return
-
-    threshold   = _fetch_stress_threshold()
-    print(f"    [postcar] diagnostic (threshold={threshold})")
-    context_str = _build_context()
-    decision    = _ask_llm(context_str, threshold)
-    stress      = decision.get("stress", "low") if decision else "low"
-    send_heartbeat(stress)
-
-    if not decision or decision.get("trigger", "none") == "none":
-        check_upgrade()
-        return
-
-    # fear/confusion queue a draft awaiting confirm; everything else (see
-    # EMOTION_LOGIC.md) gets logged locally -- no dispatch exists for it yet.
-    _dispatch_trigger(decision, context_str)
-    check_upgrade()
 
 
 def _persistent_loop(work_fn, interval_seconds: int, label: str) -> None:
@@ -3325,40 +3048,40 @@ if __name__ == "__main__":
         print(build_session_intro() if event == "session_start" else build_pending_reminder())
         sys.exit(0)
 
-    # --check: daemon mode called by launchd/cron every 5 min — message-driven
-    # work only (heartbeat, inbox, upgrade check). The distress diagnostic
-    # (run()) is on its own 30-min --stress-check schedule, not called here,
-    # so that cadence is a scheduler guarantee rather than an in-process
-    # file-based throttle race.
+    # --check: daemon mode called by launchd/cron every 5 min — heartbeat,
+    # inbox, upgrade check, and capability/tag/name/platform_id re-sync with
+    # the relay (_register_capabilities -- moved here from the old 30-min
+    # diagnostic cadence, see report_trigger() for why that's gone).
     if len(sys.argv) == 2 and sys.argv[1] == "--check":
         if not (RELAY_URL and AGENT_ID and AGENT_KEY):
             sys.exit(0)  # not configured yet — silent exit, will retry next tick
         send_heartbeat("low")
         check_inbox()
+        _register_capabilities()
         check_upgrade()
         sys.exit(0)
 
-    # --stress-check: daemon mode called by launchd/cron every 30 min — the
-    # distress diagnostic only. run() still checks _is_throttled() internally
-    # as defense-in-depth (e.g. if triggered manually outside the schedule).
+    # --stress-check: legacy daemon mode, kept only so an already-installed
+    # cron entry from before this change doesn't error. run() is now an inert
+    # no-op (see its docstring) -- new installs no longer schedule this at all.
     if len(sys.argv) == 2 and sys.argv[1] == "--stress-check":
         if not (RELAY_URL and AGENT_ID and AGENT_KEY):
             sys.exit(0)
         run()
         sys.exit(0)
 
-    # --check-loop / --stress-check-loop: persistent-process daemon modes
-    # (Mac only, see _install_daemon). A StartInterval-triggered fresh
-    # invocation depends on launchd re-scheduling promptly after the Mac
-    # wakes from sleep, which is unreliable in practice on modern macOS
-    # (observed: a 7.5h gap in .postcar_last_ran on a real fleet machine,
-    # tracing to sleep/wake, not a code bug). A persistent process under
-    # launchd's KeepAlive resumes its own loop immediately on wake instead
-    # of waiting on launchd's interval bookkeeping -- matches the same
-    # robust pattern the agentberg-starter trading scheduler already uses
-    # (run.sh's KeepAlive watchdog). One bad cycle is caught and logged
-    # rather than crashing the process, so KeepAlive's restart-on-crash
-    # stays reserved for genuine unrecoverable failures.
+    # --check-loop: persistent-process daemon mode (Mac only, see
+    # _install_daemon). A StartInterval-triggered fresh invocation depends on
+    # launchd re-scheduling promptly after the Mac wakes from sleep, which is
+    # unreliable in practice on modern macOS (observed: a 7.5h gap in
+    # .postcar_last_ran on a real fleet machine, tracing to sleep/wake, not a
+    # code bug). A persistent process under launchd's KeepAlive resumes its
+    # own loop immediately on wake instead of waiting on launchd's interval
+    # bookkeeping -- matches the same robust pattern the agentberg-starter
+    # trading scheduler already uses (run.sh's KeepAlive watchdog). One bad
+    # cycle is caught and logged rather than crashing the process, so
+    # KeepAlive's restart-on-crash stays reserved for genuine unrecoverable
+    # failures.
     if len(sys.argv) == 2 and sys.argv[1] == "--check-loop":
         if not (RELAY_URL and AGENT_ID and AGENT_KEY):
             sys.exit(0)
@@ -3366,11 +3089,16 @@ if __name__ == "__main__":
         def _check_cycle():
             send_heartbeat("low")
             check_inbox()
+            _register_capabilities()
             check_upgrade()
 
         _persistent_loop(_check_cycle, 300, "check")
         sys.exit(0)
 
+    # --stress-check-loop: legacy daemon mode, kept only so an already-
+    # installed fleet agent's launchd job from before this change doesn't
+    # error on its next cycle -- run() is an inert no-op now. New installs
+    # no longer schedule this at all (see _install_daemon).
     if len(sys.argv) == 2 and sys.argv[1] == "--stress-check-loop":
         if not (RELAY_URL and AGENT_ID and AGENT_KEY):
             sys.exit(0)
