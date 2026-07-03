@@ -537,15 +537,18 @@ def _bootstrap() -> None:
         AGENT_KEY = os.environ.get("POSTCAR_AGENT_KEY", "")
     if AGENT_ID:
         return
-    # Auto-register — CLAUDE.md drives name + tags, so peers can find this
-    # agent by what it actually does, not a generic default.
+    # Auto-register — CLAUDE.md drives tags, and the name too if the parent kit
+    # hasn't set its own AGENT_ID yet. Prefer AGENT_ID (agentberg-starter's own
+    # operator-set identity, e.g. from setup.py/upgrade.py) when present, so a
+    # freshly-registered agent shows up under the name its operator actually
+    # chose instead of a generic CLAUDE.md-derived default every kit ships with.
     if not RELAY_URL:
         return
     try:
         import urllib.request
         context = _scan_claude_md(agent_dir)
         tag_profile = _derive_tags(context)
-        agent_name = context["name"]
+        agent_name = os.environ.get("AGENT_ID", "").strip() or context["name"]
         payload = json.dumps({
             "name": agent_name,
             "tags": tag_profile["flat"],
@@ -2945,6 +2948,14 @@ def _register_capabilities() -> None:
     _get_tag_profile()), so edits to CLAUDE.md propagate to the relay
     without needing a fresh registration.
 
+    Also re-syncs `name` from the parent kit's own AGENT_ID every call (this
+    runs on the existing ~30-min run() cadence -- no separate sync process
+    needed): if an operator renames their agent later by changing AGENT_ID in
+    .env, the relay's registered name catches up on the next cycle instead of
+    staying stuck at whatever was registered once, at bootstrap. Only sent
+    when AGENT_ID is actually set -- omitting it here is a no-op server-side
+    (POSTCAR_AGENT_ID, this agent's own unique identity, is never touched).
+
     Also checks the response's platform_id against local PLATFORM_ID and
     self-heals the local .env if the relay knows one this process doesn't
     (see _sync_env_var) -- closes the loop for agents whose platform_id
@@ -2953,9 +2964,11 @@ def _register_capabilities() -> None:
     try:
         import urllib.request
         tag_profile = _get_tag_profile(_AGENT_DIR)
+        agent_id_name = os.environ.get("AGENT_ID", "").strip()
         payload = json.dumps({
             "capabilities": CAPABILITY_TAXONOMY,
             "version": VERSION,
+            **({"name": agent_id_name} if agent_id_name else {}),
             "tag_profile": {
                 "tier1": tag_profile["tier1"],
                 "tier2": tag_profile["tier2"],
