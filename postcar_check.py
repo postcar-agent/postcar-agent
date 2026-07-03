@@ -108,7 +108,7 @@ def _llm_base_url() -> str:
     return _detect_llm()[2]
 
 
-VERSION = "0.4.18"
+VERSION = "0.4.19"
 
 _ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".postcar.env")
 
