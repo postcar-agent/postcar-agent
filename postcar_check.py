@@ -1597,11 +1597,12 @@ def _fetch_sender_credibility(agent_id: str) -> float | None:
 
 def _sender_tier(from_agent: str) -> str:
     """platform (support team) | synthetic (pooled — not yet produced by the
-    network) | single (default, one peer agent)."""
-    platform_ids = {
-        a.strip() for a in os.environ.get("POSTCAR_PLATFORM_AGENT_IDS", "").split(",") if a.strip()
-    }
-    if from_agent in platform_ids:
+    network) | single (default, one peer agent). Reuses PLATFORM_ID (the
+    same POSTCAR_PLATFORM_ID this agent already sends its own
+    --platform-report to) rather than a separate list -- any agent that
+    can report to its platform operator also recognizes messages from
+    that operator, no extra config needed."""
+    if PLATFORM_ID and from_agent == PLATFORM_ID:
         return "platform"
     return "single"
 
