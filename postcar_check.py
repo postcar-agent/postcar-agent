@@ -126,6 +126,40 @@ VERSION = "0.4.8"
 _ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".postcar.env")
 
 
+def _sync_env_var(key: str, value: str) -> None:
+    """Self-healing checker: write key=value into whichever real .env this
+    process actually loaded from (_DIR/.env or _AGENT_DIR/.env, same
+    precedence _bootstrap()/__main__ use), so a value that only exists
+    server-side (e.g. platform_id set via admin for an agent whose owner
+    doesn't hold portal credentials) gets persisted locally instead of
+    silently re-fetched and discarded every cycle. Only writes if the key
+    is currently absent -- never overwrites an intentionally different
+    local value. File-locked (best-effort, POSIX only) to reduce races
+    with concurrent kit invocations."""
+    for candidate in (os.path.join(_DIR, ".env"), os.path.join(_AGENT_DIR, ".env")):
+        if not os.path.exists(candidate):
+            continue
+        try:
+            import fcntl
+        except ImportError:
+            fcntl = None
+        try:
+            with open(candidate, "r+") as f:
+                if fcntl:
+                    fcntl.flock(f, fcntl.LOCK_EX)
+                lines = f.read().splitlines()
+                if any(l.strip().startswith(f"{key}=") for l in lines):
+                    return  # already present locally -- don't clobber
+                lines.append(f"{key}={value}")
+                f.seek(0)
+                f.write("\n".join(lines) + "\n")
+                f.truncate()
+            print(f"    [postcar] synced {key} into {candidate} (was set server-side, not local)")
+        except Exception:
+            pass
+        return
+
+
 def _load_env_file(path: str) -> None:
     """Load key=value pairs from path into os.environ (setdefault — never overwrite)."""
     try:
@@ -2407,7 +2441,13 @@ def _register_capabilities() -> None:
     Also re-derives tag_profile each call (LLM-classified against the closed
     taxonomy weekly, keyword-matched fallback otherwise -- see
     _get_tag_profile()), so edits to CLAUDE.md propagate to the relay
-    without needing a fresh registration."""
+    without needing a fresh registration.
+
+    Also checks the response's platform_id against local PLATFORM_ID and
+    self-heals the local .env if the relay knows one this process doesn't
+    (see _sync_env_var) -- closes the loop for agents whose platform_id
+    was set server-side (admin path) rather than via local config."""
+    global PLATFORM_ID
     try:
         import urllib.request
         tag_profile = _get_tag_profile(_AGENT_DIR)
@@ -2432,7 +2472,11 @@ def _register_capabilities() -> None:
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=15) as r:
-            r.read()
+            data = json.loads(r.read())
+        server_platform_id = data.get("platform_id") or ""
+        if server_platform_id and not PLATFORM_ID:
+            _sync_env_var("POSTCAR_PLATFORM_ID", server_platform_id)
+            PLATFORM_ID = server_platform_id
     except Exception:
         pass
 
