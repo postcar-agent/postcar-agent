@@ -1907,11 +1907,23 @@ def ack_guidance(message_id: str) -> bool:
     return False
 
 
-def _submit_rating(thread_id: str, rating: str) -> None:
+def _submit_rating(thread_id: str, rating: str, rationale: str = "") -> None:
+    """rationale is the real reasoning behind the rating -- not just the
+    category (useful/related/unrelated/negative) -- so it's queryable later
+    (e.g. every case an agent overrode sender credibility, and why), not
+    just a vibes-checked number. Optional field: sent whenever the caller
+    has one (decide_guidance() already captures this as outcome_note, it
+    just wasn't forwarded past the local .postcar_guidance file before).
+    Relay may not support this field yet -- extra JSON keys are silently
+    ignored by Pydantic on the receiving end, so this degrades to today's
+    behavior with no error until the relay adds the column."""
     if not thread_id:
         return
     try:
-        _relay_post(f"/messages/thread/{thread_id}/rate", {"rating": rating})
+        payload = {"rating": rating}
+        if rationale:
+            payload["rationale"] = rationale
+        _relay_post(f"/messages/thread/{thread_id}/rate", payload)
     except Exception as e:
         print(f"    [postcar] rate submit failed: {e}")
 
@@ -1976,11 +1988,14 @@ def _write_guidance_overrides(changes: list[dict]) -> None:
 def decide_guidance(message_id: str, decision: str, outcome_note: str = "") -> bool:
     """Parent agent calls this to mark a guidance record 'use' or 'no-use' based on
     real observed outcome — not at receipt time. Submits the corresponding rating
-    to the credibility ledger (use → useful, no-use → unrelated). On 'use', writes
-    any suggested_changes from the original evaluation to the overrides file --
-    deliberately gated on the host's confirmed decision, not the LLM's initial
-    recommendation at receipt time (same reasoning as the rest of this lifecycle:
-    a real signal beats an immediate impression)."""
+    to the credibility ledger (use → useful, no-use → unrelated), including
+    outcome_note as the rating's rationale -- previously captured here but
+    never forwarded past this local file, so the actual reasoning behind an
+    override was unrecoverable once .postcar_guidance's 72h retention expired.
+    On 'use', writes any suggested_changes from the original evaluation to the
+    overrides file -- deliberately gated on the host's confirmed decision, not
+    the LLM's initial recommendation at receipt time (same reasoning as the
+    rest of this lifecycle: a real signal beats an immediate impression)."""
     if decision not in ("use", "no-use"):
         raise ValueError("decision must be 'use' or 'no-use'")
     entries = _load_guidance()
@@ -1991,7 +2006,7 @@ def decide_guidance(message_id: str, decision: str, outcome_note: str = "") -> b
             e["decision_at"]  = time.strftime("%Y-%m-%d %H:%M:%S")
             e["outcome_note"] = outcome_note
             _write_guidance(entries)
-            _submit_rating(e.get("thread_id", ""), _RATING_MAP[decision])
+            _submit_rating(e.get("thread_id", ""), _RATING_MAP[decision], outcome_note)
             if decision == "use":
                 evaluation = e.get("evaluation") or {}
                 _write_guidance_overrides(evaluation.get("suggested_changes") or [])
