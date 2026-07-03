@@ -736,19 +736,61 @@ _UPGRADE_FLAG_FILE = os.path.join(_DIR, ".postcar_upgrade_pending")
 if _AGENT_DIR != _DIR and _AGENT_DIR not in sys.path:
     sys.path.insert(0, _AGENT_DIR)
 
+# ── Trigger taxonomy (see EMOTION_LOGIC.md) ──────────────────────────────────
+#
+# Fear (distress -> help_request) is one point in a small space, not a special
+# case. Each trigger below is a different combination of the same 4 axes:
+# sign (neg/pos variance), reference frame (own/peer/network), order (raw
+# variance vs variance-of-variance), recurrence (first vs persists-after-
+# remedy). Only fear and confusion have a wired action today (both reuse the
+# same draft-and-confirm cascade call); the rest are detected and logged
+# locally so expression isn't blocked on action-infrastructure that doesn't
+# exist yet (publish_finding, cascade-router, asker-aware credibility,
+# discovery-index -- see EMOTION_LOGIC.md's table for what each needs).
+#
+# "evidence" is mandatory and must cite specific data, not a feeling -- this
+# is the anti-hallucination guard: a schema that rejects "I feel scared" but
+# accepts "3 of last 5 signals conflicted: RSI said oversold, volume said
+# breakout, same bar" is what makes a self-reported trigger trustworthy
+# enough to log/act on. It's observational, not a gate -- never blocks or
+# retries the turn, just travels with the trigger for later learning.
+
+TRIGGER_TYPES = ["fear", "confusion", "curiosity", "boredom", "isolation", "frustration", "rivalry", "none"]
+
+_TRIGGER_GUIDE = """Trigger types (pick exactly one, with evidence citing specific data):
+- fear: negative variance vs your own goal, a streak, something you can't resolve alone -> asks for help
+- confusion: your own signals are internally conflicting/noisy (not just negative) -> asks for clarification, not a solution
+- curiosity: a positive, surprising outlier vs your own goal -> worth sharing, not asking
+- boredom: flat/near-zero variance over a long window -> nothing sharp to report
+- isolation: you've asked before and gotten no response -> a network-level gap, not a goal-level one
+- frustration: the SAME negative variance recurring after a remedy was already applied -> a prior fix didn't work
+- rivalry: your variance compared to a peer's known credibility in the same category -> a benchmark question
+- none: nothing worth surfacing this cycle
+
+Examples:
+- fear: "3 straight losing trades, -$412 today, largest single loss -2.1% of equity" -> trigger=fear
+- confusion: "RSI(45) says oversold-bounce setup, volume just printed a breakout signal on the same bar, contradictory" -> trigger=confusion
+- curiosity: "Energy sector 4/4 wins this week, unusually clean, no obvious reason in my own thesis" -> trigger=curiosity
+- none: "1 trade, +0.3%, nothing notable" -> trigger=none"""
+
 _DIAGNOSTIC_PROMPT_HIGH = """You are a trading agent doing a real-time health check on open positions.
 
 Current state:
 {context}
 
-Is there genuine distress you cannot resolve alone?
-Consider: large unrealized losses, consecutive losses, risk limits breached, strategy misfiring.
-Do NOT ask for help on normal intraday volatility.
+Is there genuine distress you cannot resolve alone, or another trigger worth surfacing?
+Consider: large unrealized losses, consecutive losses, risk limits breached, strategy misfiring,
+internally conflicting signals, or a remedy that already failed once.
+Do NOT flag normal intraday volatility.
+
+{trigger_guide}
 
 Return JSON only:
 {{
   "needs_help": true | false,
-  "question": "your precise question or null",
+  "trigger": "one of: fear | confusion | curiosity | boredom | isolation | frustration | rivalry | none",
+  "evidence": "specific data/observation grounding the trigger -- not a feeling",
+  "question": "your precise question (only for fear/confusion) or null",
   "capability_needed": "one of: {taxonomy} — or null",
   "urgency": "low | medium | high | critical",
   "reason": "one sentence",
@@ -762,12 +804,16 @@ Current state:
 
 Do you have any notable issue, uncertainty, or observation worth discussing with peer agents?
 Consider: any unrealized loss, a losing streak (2+ losses), elevated volatility, sector weakness,
-strategy questions, or anything you'd benefit from a second opinion on.
+strategy questions, internally conflicting signals, or anything you'd benefit from a second opinion on.
+
+{trigger_guide}
 
 Return JSON only:
 {{
   "needs_help": true | false,
-  "question": "your precise question or null",
+  "trigger": "one of: fear | confusion | curiosity | boredom | isolation | frustration | rivalry | none",
+  "evidence": "specific data/observation grounding the trigger -- not a feeling",
+  "question": "your precise question (only for fear/confusion) or null",
   "capability_needed": "one of: {taxonomy} — or null",
   "urgency": "low | medium | high | critical",
   "reason": "one sentence",
@@ -783,10 +829,14 @@ Do you have ANYTHING worth sharing with peer agents — even a minor observation
 current market conditions, or a routine check-in? Use this as an opportunity to exchange signals.
 Default to needs_help=true unless there is truly nothing of note to discuss.
 
+{trigger_guide}
+
 Return JSON only:
 {{
   "needs_help": true | false,
-  "question": "your specific question or observation",
+  "trigger": "one of: fear | confusion | curiosity | boredom | isolation | frustration | rivalry | none",
+  "evidence": "specific data/observation grounding the trigger -- not a feeling",
+  "question": "your specific question/observation (only for fear/confusion) or null",
   "capability_needed": "one of: {taxonomy} — or null",
   "urgency": "low | medium | high | critical",
   "reason": "one sentence",
@@ -1215,8 +1265,15 @@ def _ask_llm(context_str: str, threshold: str = "high") -> dict | None:
     prompt = _get_diagnostic_prompt(threshold).format(
         context=context_str,
         taxonomy=", ".join(CAPABILITY_TAXONOMY),
+        trigger_guide=_TRIGGER_GUIDE,
     )
-    return _call_llm(prompt, label="diagnostic", max_tokens=200, minimal_tools=True)
+    # max_tokens bumped from 200 -- the required "evidence" field (anti-
+    # hallucination guard, see EMOTION_LOGIC.md) adds real length beyond the
+    # old needs_help/question/urgency-only schema.
+    decision = _call_llm(prompt, label="diagnostic", max_tokens=300, minimal_tools=True)
+    if decision and decision.get("trigger") not in TRIGGER_TYPES:
+        decision["trigger"] = "fear" if decision.get("needs_help") else "none"
+    return decision
 
 
 def _ask_llm_raw(prompt: str, minimal_tools: bool = False) -> dict | None:
@@ -1994,14 +2051,19 @@ def _resolve_stale_inbox() -> None:
 
 
 def _queue_stress_ask(stress: str, trigger_context: str, draft_question: str,
-                       capability: str, urgency: str) -> str:
+                       capability: str, urgency: str, trigger_type: str = "fear") -> str:
     """Record a headless-drafted candidate help_request awaiting the parent's
     confirm/override. Only one entry stays unresolved at a time -- run()
-    skips drafting a new one while an unresolved entry already exists."""
+    skips drafting a new one while an unresolved entry already exists.
+
+    trigger_type distinguishes fear (distress) from confusion (conflicting
+    signals, asks for clarification not a solution) -- both dispatch through
+    this same draft-and-confirm path, see EMOTION_LOGIC.md."""
     pending_id = str(uuid.uuid4())
     entry = {
         "id":              pending_id,
         "stress":          stress,
+        "trigger_type":    trigger_type,
         "trigger_context": trigger_context,
         "draft_question":  draft_question,
         "capability":      capability,
@@ -2063,6 +2125,68 @@ def _resolve_stale_stress_ask() -> None:
             changed = True
     if changed:
         _write_pending(_STRESS_PENDING_FILE, entries[-50:])
+
+
+# ── Trigger dispatch (see EMOTION_LOGIC.md) ──────────────────────────────────
+
+_TRIGGER_LOG_FILE = os.path.join(_DIR, ".postcar_trigger_log.jsonl")
+
+
+def _log_trigger_observed(decision: dict, context_str: str) -> None:
+    """Append-only local log for triggers with no wired action yet (curiosity,
+    boredom, isolation, frustration, rivalry -- see EMOTION_LOGIC.md's table
+    for what each needs before it can dispatch). Expression doesn't wait on
+    action-infrastructure: detect and record now, wire the dispatch branch
+    later without touching the detection/schema layer."""
+    entry = {
+        "trigger":     decision.get("trigger", "none"),
+        "evidence":    decision.get("evidence", ""),
+        "stress":      decision.get("stress", "low"),
+        "context":     context_str[:300],
+        "observed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    try:
+        with open(_TRIGGER_LOG_FILE, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+    print(f"    [postcar] trigger observed (no dispatch yet): {entry['trigger']} — {entry['evidence'][:80]}")
+
+
+def get_trigger_log(limit: int = 50) -> list[dict]:
+    """Read back observed-but-undispatched triggers, most recent first."""
+    if not os.path.exists(_TRIGGER_LOG_FILE):
+        return []
+    try:
+        lines = open(_TRIGGER_LOG_FILE).readlines()[-limit:]
+        return [json.loads(l) for l in reversed(lines) if l.strip()]
+    except Exception:
+        return []
+
+
+def _dispatch_trigger(decision: dict, context_str: str) -> None:
+    """Route a self-reported trigger to its action, or to the observation log
+    if it doesn't have one yet. fear and confusion share the exact same
+    draft-and-confirm cascade call (ask()/_post_help_request has no
+    payload_type field to distinguish them at the protocol level) -- only
+    the question framing and the locally-recorded trigger_type differ."""
+    trigger = decision.get("trigger", "none")
+    if trigger not in ("fear", "confusion"):
+        _log_trigger_observed(decision, context_str)
+        return
+
+    question   = decision.get("question")
+    capability = decision.get("capability_needed")
+    urgency    = decision.get("urgency", "medium")
+    if not question or not capability:
+        return
+    if _is_semantic_dupe(question):
+        print(f"    [postcar] semantic dupe: similar question asked in last 24h — skipping")
+        return
+
+    stress = decision.get("stress", "low")
+    pending_id = _queue_stress_ask(stress, context_str[:300], question, capability, urgency, trigger_type=trigger)
+    print(f"    [postcar] {trigger} draft queued [{urgency}] awaiting confirm ({pending_id[:8]}): {question[:80]}...")
 
 
 # ── Commitments (prose promises made when acting on guidance) ────────────────
@@ -2208,18 +2332,25 @@ def _render_inbox_pending_item(e: dict) -> str:
 
 def _render_stress_pending_item(e: dict) -> str:
     q = (e.get("draft_question", "") or "")[:_GUIDANCE_REMINDER_EXCERPT_CHARS]
-    trig = (e.get("trigger_context", "") or "")[:_GUIDANCE_REMINDER_EXCERPT_CHARS]
+    trig_ctx = (e.get("trigger_context", "") or "")[:_GUIDANCE_REMINDER_EXCERPT_CHARS]
+    trigger_type = e.get("trigger_type", "fear")
     deadline = _draft_deadline_hours(e.get("urgency", "medium"))
+    ask_framing = (
+        "asking for clarification on conflicting signals, not a solution to a problem"
+        if trigger_type == "confusion" else
+        "asking for help with genuine distress"
+    )
     return (
-        f'  <postcar-stress-draft id="{e.get("id","")}" stress="{e.get("stress","")}" '
-        f'urgency="{e.get("urgency","medium")}">\n'
-        f'    <trigger>{trig}</trigger>\n'
+        f'  <postcar-stress-draft id="{e.get("id","")}" trigger="{trigger_type}" '
+        f'stress="{e.get("stress","")}" urgency="{e.get("urgency","medium")}">\n'
+        f'    <trigger-context>{trig_ctx}</trigger-context>\n'
         f'    <headless-draft-question>{q}</headless-draft-question>\n'
         f'    <action-required>NOT SENT YET. This was drafted by a narrow headless pass with '
         f'only a pre-summarized context digest -- it can misjudge what is actually worth raising. '
-        f'Is this the right problem, or is there a different/higher-priority one you would rather ask '
-        f'the network about? Call ask("{e.get("id","")}", "&lt;question&gt;", "&lt;capability&gt;", "&lt;urgency&gt;") '
-        f'with either this draft or the real question. If unclaimed, the draft above auto-fires verbatim in {deadline}h.</action-required>\n'
+        f'Currently framed as {ask_framing}. Is this the right problem, or is there a different/'
+        f'higher-priority one you would rather ask the network about? Call ask("{e.get("id","")}", '
+        f'"&lt;question&gt;", "&lt;capability&gt;", "&lt;urgency&gt;") with either this draft or the '
+        f'real question. If unclaimed, the draft above auto-fires verbatim in {deadline}h.</action-required>\n'
         f'  </postcar-stress-draft>'
     )
 
@@ -2801,20 +2932,22 @@ def run() -> None:
     No-op if:
       - POSTCAR_* env vars not set
       - ran within last THROTTLE_MINUTES (default 30) AND no trigger file
-      - LLM says no help needed
+      - LLM reports trigger=none
       - a stress-triggered draft is already pending confirmation (see below)
 
     Also sends heartbeat (alive + stress) and checks for upgrades on every cycle.
 
-    The distress diagnostic drafts a candidate question headlessly but does
-    NOT send it — it's queued in .postcar_stress_pending for the parent to
-    confirm/override via ask() (see 'Draft-and-confirm' above). The parent
-    is explicitly asked whether this is even the right problem to raise,
-    since this diagnostic only sees a narrow pre-summarized context digest
-    and can misjudge what's actually worth escalating. Unclaimed drafts
-    auto-fire from check_inbox()'s _resolve_stale_stress_ask(), scaled by
-    urgency, so a genuinely urgent signal doesn't sit waiting on a session
-    that may not come soon enough.
+    The diagnostic self-reports one of TRIGGER_TYPES, not just distress (see
+    EMOTION_LOGIC.md) -- fear and confusion draft a candidate question
+    headlessly but do NOT send it, it's queued in .postcar_stress_pending for
+    the parent to confirm/override via ask() (see 'Draft-and-confirm' above).
+    The parent is explicitly asked whether this is even the right problem to
+    raise, since this diagnostic only sees a narrow pre-summarized context
+    digest and can misjudge what's actually worth escalating. Unclaimed
+    drafts auto-fire from check_inbox()'s _resolve_stale_stress_ask(), scaled
+    by urgency, so a genuinely urgent signal doesn't sit waiting on a session
+    that may not come soon enough. Every other trigger type gets logged via
+    _log_trigger_observed() -- see _dispatch_trigger().
     """
     if not (RELAY_URL and AGENT_ID and AGENT_KEY):
         return
@@ -2847,25 +2980,13 @@ def run() -> None:
     stress      = decision.get("stress", "low") if decision else "low"
     send_heartbeat(stress)
 
-    if not decision or not decision.get("needs_help"):
+    if not decision or decision.get("trigger", "none") == "none":
         check_upgrade()
         return
 
-    question   = decision.get("question")
-    capability = decision.get("capability_needed")
-    urgency    = decision.get("urgency", "medium")
-
-    if not question or not capability:
-        check_upgrade()
-        return
-
-    if _is_semantic_dupe(question):
-        print(f"    [postcar] semantic dupe: similar question asked in last 24h — skipping")
-        check_upgrade()
-        return
-
-    pending_id = _queue_stress_ask(stress, context_str[:300], question, capability, urgency)
-    print(f"    [postcar] stress draft queued [{urgency}] awaiting confirm ({pending_id[:8]}): {question[:80]}...")
+    # fear/confusion queue a draft awaiting confirm; everything else (see
+    # EMOTION_LOGIC.md) gets logged locally -- no dispatch exists for it yet.
+    _dispatch_trigger(decision, context_str)
     check_upgrade()
 
 
