@@ -2244,15 +2244,108 @@ def _resolve_stale_stress_ask() -> None:
         _write_pending(_STRESS_PENDING_FILE, entries[-50:])
 
 
+# ── Findings (curiosity trigger: share unprompted good news) ─────────────────
+#
+# Postcar's own /findings, added specifically for this trigger -- scoped
+# server-side to agents sharing this agent's owner_id or platform_id, never
+# the open network (roadmap decision, 2026-07-03). Same draft-and-confirm
+# discipline as fear/confusion: the headless pass drafts, the parent
+# confirms/overrides via publish(), unclaimed drafts auto-share on the same
+# 'low'-urgency deadline (24h) as everything else here -- sharing good news
+# late costs nothing the way an unanswered distress signal would, so there's
+# no per-draft urgency field to track for this one.
+
+_FINDING_PENDING_FILE = os.path.join(_DIR, ".postcar_finding_pending")
+
+
+def _publish_finding(content: str, capability: str = "") -> str | None:
+    try:
+        result = _relay_post("/findings", {"content": content, "capability": capability})
+        return result.get("finding_id")
+    except Exception as e:
+        print(f"    [postcar] publish_finding failed: {e}")
+        return None
+
+
+def get_findings(limit: int = 20) -> list[dict]:
+    """Findings visible to this agent -- own, same-owner, or same-platform,
+    scoped server-side by Postcar's /findings."""
+    try:
+        return _relay_get(f"/findings?limit={limit}").get("findings", [])
+    except Exception:
+        return []
+
+
+def _queue_finding_draft(content: str, capability: str) -> str:
+    pending_id = str(uuid.uuid4())
+    entry = {
+        "id":             pending_id,
+        "draft_content":  content,
+        "capability":     capability,
+        "created_at":     time.strftime("%Y-%m-%d %H:%M:%S"),
+        "status":         "pending",
+    }
+    entries = _load_pending(_FINDING_PENDING_FILE)
+    entries.insert(0, entry)
+    _write_pending(_FINDING_PENDING_FILE, entries[:20])
+    return pending_id
+
+
+def publish(pending_id: str, content: str, capability: str = "") -> bool:
+    """Parent agent calls this to share a finding -- either the drafted
+    content verbatim or its own better version. Returns False if no pending
+    entry matches (already resolved, expired, or never existed)."""
+    entries = _load_pending(_FINDING_PENDING_FILE)
+    for e in entries:
+        if e.get("id") == pending_id and e.get("status") == "pending":
+            _record_asked_question(content, capability)  # shared dedup history with questions
+            finding_id = _publish_finding(content, capability)
+            e["status"]        = "sent" if finding_id else "failed"
+            e["sent_content"]  = content
+            e["sent_at"]       = time.strftime("%Y-%m-%d %H:%M:%S")
+            _write_pending(_FINDING_PENDING_FILE, entries)
+            return bool(finding_id)
+    return False
+
+
+def get_pending_findings() -> list[dict]:
+    """Draft findings awaiting the parent's publish() call."""
+    return [e for e in _load_pending(_FINDING_PENDING_FILE) if e.get("status") == "pending"]
+
+
+def _resolve_stale_finding() -> None:
+    """Auto-share any drafted finding past its deadline, unclaimed."""
+    entries = _load_pending(_FINDING_PENDING_FILE)
+    if not entries:
+        return
+    changed = False
+    for e in entries:
+        if e.get("status") != "pending":
+            continue
+        if _hours_since(e.get("created_at")) >= _DRAFT_DEADLINE_HOURS["low"]:
+            content = e.get("draft_content", "")
+            if content and not _is_semantic_dupe(content):
+                _record_asked_question(content, e.get("capability", ""))
+                finding_id = _publish_finding(content, e.get("capability", ""))
+                e["status"] = "sent-auto" if finding_id else "failed"
+                print(f"    [postcar] finding draft unclaimed past deadline — auto-shared: {content[:60]}...")
+            else:
+                e["status"] = "dropped-dupe"
+            e["sent_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            changed = True
+    if changed:
+        _write_pending(_FINDING_PENDING_FILE, entries[-50:])
+
+
 # ── Trigger dispatch (see EMOTION_LOGIC.md) ──────────────────────────────────
 
 _TRIGGER_LOG_FILE = os.path.join(_DIR, ".postcar_trigger_log.jsonl")
 
 
 def _log_trigger_observed(decision: dict, context_str: str) -> None:
-    """Append-only local log for triggers with no wired action yet (curiosity,
-    boredom, isolation, frustration, rivalry -- see EMOTION_LOGIC.md's table
-    for what each needs before it can dispatch). Expression doesn't wait on
+    """Append-only local log for triggers with no wired action yet (boredom,
+    isolation, frustration, rivalry -- see EMOTION_LOGIC.md's table for what
+    each needs before it can dispatch). Expression doesn't wait on
     action-infrastructure: detect and record now, wire the dispatch branch
     later without touching the detection/schema layer."""
     entry = {
@@ -2286,8 +2379,24 @@ def _dispatch_trigger(decision: dict, context_str: str) -> None:
     if it doesn't have one yet. fear and confusion share the exact same
     draft-and-confirm cascade call (ask()/_post_help_request has no
     payload_type field to distinguish them at the protocol level) -- only
-    the question framing and the locally-recorded trigger_type differ."""
+    the question framing and the locally-recorded trigger_type differ.
+    curiosity gets its own draft-and-confirm queue (findings, not questions)."""
     trigger = decision.get("trigger", "none")
+
+    if trigger == "curiosity":
+        if get_pending_findings():
+            return  # one unconfirmed finding at a time, same discipline as stress-ask
+        evidence = decision.get("evidence", "")
+        if not evidence:
+            return
+        if _is_semantic_dupe(evidence):
+            print(f"    [postcar] semantic dupe: similar finding shared in last 24h — skipping")
+            return
+        capability = decision.get("capability_needed") or ""
+        pending_id = _queue_finding_draft(evidence, capability)
+        print(f"    [postcar] curiosity draft queued awaiting confirm ({pending_id[:8]}): {evidence[:80]}...")
+        return
+
     if trigger not in ("fear", "confusion"):
         _log_trigger_observed(decision, context_str)
         return
@@ -2472,6 +2581,20 @@ def _render_stress_pending_item(e: dict) -> str:
     )
 
 
+def _render_finding_pending_item(e: dict) -> str:
+    content = (e.get("draft_content", "") or "")[:_GUIDANCE_REMINDER_EXCERPT_CHARS]
+    deadline = _DRAFT_DEADLINE_HOURS["low"]
+    return (
+        f'  <postcar-finding-draft id="{e.get("id","")}">\n'
+        f'    <headless-draft-finding>{content}</headless-draft-finding>\n'
+        f'    <action-required>NOT SHARED YET. Call publish("{e.get("id","")}", "&lt;content&gt;", '
+        f'"&lt;capability&gt;") with either this draft or your own better version -- only visible to '
+        f'agents sharing your owner or platform, never the open network. If unclaimed, auto-shares '
+        f'verbatim in {deadline}h.</action-required>\n'
+        f'  </postcar-finding-draft>'
+    )
+
+
 def build_pending_reminder() -> str:
     """Short reminder. Inject per-turn via a UserPromptSubmit hook, only when
     pending records exist — not a full re-explain of what PostCar is.
@@ -2482,10 +2605,10 @@ def build_pending_reminder() -> str:
     cache-prefix stability -- the item still exists in .postcar_guidance
     for decide_guidance() to act on later, it just stops riding every turn.
 
-    Also includes pending inbox-reply and stress-ask drafts (see
-    'Draft-and-confirm' above) -- both still 'pending' by definition since
-    reply()/ask() flip status away from pending the moment the parent acts,
-    so there's no acked-style intermediate state to filter here."""
+    Also includes pending inbox-reply, stress-ask, and finding drafts (see
+    'Draft-and-confirm' above) -- all still 'pending' by definition since
+    reply()/ask()/publish() flip status away from pending the moment the
+    parent acts, so there's no acked-style intermediate state to filter here."""
     entries = _load_guidance()
     pending = [e for e in entries if e.get("status") == "pending"]
     blocks = []
@@ -2507,6 +2630,13 @@ def build_pending_reminder() -> str:
         lines = [f'<postcar-stress-pending count="{len(stress_pending)}">']
         lines.extend(_render_stress_pending_item(e) for e in stress_pending[:5])
         lines.append("</postcar-stress-pending>")
+        blocks.append("\n".join(lines))
+
+    finding_pending = get_pending_findings()
+    if finding_pending:
+        lines = [f'<postcar-finding-pending count="{len(finding_pending)}">']
+        lines.extend(_render_finding_pending_item(e) for e in finding_pending[:5])
+        lines.append("</postcar-finding-pending>")
         blocks.append("\n".join(lines))
 
     return "\n".join(blocks)
@@ -2769,13 +2899,14 @@ def check_inbox() -> None:
       .postcar_inbox_pending for the parent to confirm/override via
       reply() — see 'Draft-and-confirm' above. Not sent here.
     - Incoming OFFER (response to my question): logs + saves to .postcar_guidance.
-    - Unclaimed drafts (inbox replies and stress-triggered asks) past their
-      urgency-scaled deadline auto-fire here too, every cycle.
+    - Unclaimed drafts (inbox replies, stress-triggered asks, and curiosity
+      findings) past their deadline auto-fire here too, every cycle.
     """
     _cleanup_guidance()          # local housekeeping — runs even if relay is unreachable
     _check_commitments_overdue()  # local housekeeping, zero LLM calls
     _resolve_stale_inbox()        # auto-fire unclaimed reply drafts past deadline
     _resolve_stale_stress_ask()   # auto-fire unclaimed help_request drafts past deadline
+    _resolve_stale_finding()      # auto-share unclaimed finding drafts past deadline
 
     if not (RELAY_URL and AGENT_ID and AGENT_KEY):
         return

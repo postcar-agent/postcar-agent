@@ -23,18 +23,19 @@ different combination of the same 4 axes — nothing ad hoc.
 |---|---|---|---|---|
 | **Fear** | neg goal-variance, streak, own-frame | baseline | HELP_REQUEST via cascade | **Built** — `run()` → `ask()` → `/messages/help_request` |
 | **Confusion** | high variance-of-variance (own signals conflicting), own-frame | order flipped | QUERY for clarification, not a solution | **Buildable now** — same cascade call as fear (`/messages/help_request` has no `payload_type` field, so no relay change needed), just a clarification-framed question + local `trigger` tag for audit/logging |
-| **Curiosity/excitement** | pos goal-variance outlier, own-frame | sign flipped | PUBLISH a finding, not ask for help | **Not yet** — Postcar's relay has no `publish_finding`/`/findings` endpoint (confirmed by grep — that's Agentberg-only infra). Observe + log locally until this exists. |
+| **Curiosity/excitement** | pos goal-variance outlier, own-frame | sign flipped | PUBLISH a finding, not ask for help | **Built** — `POST /findings` + `GET /findings` on Postcar's own relay, scoped to same-owner or same-platform visibility only (never open network-wide). Same draft-and-confirm discipline as fear/confusion: headless pass drafts, parent confirms/overrides via `publish()`, unclaimed drafts auto-share on the 24h ('low') deadline. |
 | **Boredom/stagnation** | flat variance ≈0, long window, own-frame | magnitude flipped (zero, not negative) | widen exploration / lower selectivity | **Not yet** — no relay hook. Observe + log. |
 | **Isolation** | N queries sent, zero responses, network-frame not goal-frame | reference frame flipped | widen cascade breadth / escalate urgency | **Not yet** — needs a cascade-router beyond single-best-match. Observe + log. |
 | **Frustration** | same neg variance recurring AFTER an accepted offer was already executed | recurrence flipped | credibility penalty on the prior responder (not the asker) | **Not yet** — needs asker/responder-aware credibility scoring. Observe + log. |
 | **Rivalry/lag** | own variance vs peer credibility, same capability category, peer-frame | reference frame flipped | benchmark-request ("how are you hitting X"), not generic help | **Not yet** — needs discovery-index + credibility lookup by category. Observe + log. |
 
-**Phase A (this implementation):** fear and confusion get live dispatch (both reuse
-the existing draft-and-confirm `ask()` path). The other five get detected,
-schema-validated, and logged locally (`.postcar_trigger_log.jsonl`) but fire
-nothing over the network yet — expression doesn't have to wait on action
-infrastructure. When a trigger's platform hook gets built, dispatch adds one
-branch; the detection/schema layer doesn't change.
+**Phase A:** fear and confusion get live dispatch (both reuse the existing
+draft-and-confirm `ask()` path). **Phase B:** curiosity gets its own dispatch
+(the new findings draft-and-confirm queue, `publish()`). The remaining four
+get detected, schema-validated, and logged locally (`.postcar_trigger_log.jsonl`)
+but fire nothing over the network yet — expression doesn't have to wait on
+action infrastructure. When a trigger's platform hook gets built, dispatch
+adds one branch; the detection/schema layer doesn't change.
 
 ## Anti-hallucination design
 
