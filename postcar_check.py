@@ -595,11 +595,24 @@ def _install_daemon() -> None:
     in-process file-based throttle (which has no locking and can race if two
     processes ever hit it at once):
 
-      --check         every 5 min  — heartbeat, inbox, upgrade check
-      --stress-check  every 30 min — the distress diagnostic (run())
+      --check-loop         every 5 min  — heartbeat, inbox, upgrade check
+      --stress-check-loop  every 30 min — the distress diagnostic (run())
 
-    Mac  → ~/Library/LaunchAgents/com.postcar.<agent>[.stress].plist
-    Linux → two crontab entries
+    Mac (KeepAlive persistent process, see _persistent_loop) →
+      ~/Library/LaunchAgents/com.postcar.<agent>[.stress].plist
+    Linux (still discrete cron-triggered --check/--stress-check invocations
+      -- servers rarely sleep, and cron doesn't have a KeepAlive concept) →
+      two crontab entries
+
+    Mac used to run these on launchd's StartInterval instead -- a discrete
+    fresh invocation every N seconds. StartInterval does not reliably
+    re-fire promptly after the Mac wakes from sleep on modern macOS
+    (observed: a real 7.5h gap in .postcar_last_ran on a fleet machine,
+    traced to sleep/wake, not a code bug); KeepAlive keeps one persistent
+    process alive that resumes its own loop immediately on wake instead of
+    depending on launchd's interval bookkeeping -- the same pattern the
+    agentberg-starter trading scheduler's own run.sh watchdog already uses.
+
     Tracks which jobs succeeded in .postcar_daemon_installed (comma list);
     retries only the missing ones on each call, so an already-installed job
     is NEVER touched again (no unload/reload) once its name is recorded --
@@ -613,6 +626,11 @@ def _install_daemon() -> None:
     {"check"} below -- it always meant the 5-min job, never "stress" (which
     didn't exist yet when it was written) -- so only the genuinely new
     "stress" job is ever installed for an agent upgrading from that format.
+    Same reasoning is why this switch to KeepAlive only applies to jobs not
+    yet installed: migrating an agent's EXISTING StartInterval job to
+    KeepAlive would require exactly the unload+reload this whole idempotency
+    design exists to avoid. Already-running fleet agents keep their current
+    StartInterval jobs unless explicitly migrated by hand.
     """
     _dir = os.path.dirname(os.path.abspath(__file__))
     sentinel = os.path.join(_dir, ".postcar_daemon_installed")
@@ -636,6 +654,11 @@ def _install_daemon() -> None:
             plist_dir  = os.path.expanduser("~/Library/LaunchAgents")
             plist_path = os.path.join(plist_dir, f"{label}.plist")
             os.makedirs(plist_dir, exist_ok=True)
+            # KeepAlive, not StartInterval -- arg is one of the --*-loop modes,
+            # a persistent process that sleeps interval_seconds internally
+            # (_persistent_loop) and resumes immediately on wake, rather than
+            # a fresh invocation launchd has to re-trigger. See _install_daemon
+            # docstring for why.
             plist = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -651,8 +674,8 @@ def _install_daemon() -> None:
     </array>
     <key>WorkingDirectory</key>
     <string>{_dir}</string>
-    <key>StartInterval</key>
-    <integer>{interval_seconds}</integer>
+    <key>KeepAlive</key>
+    <true/>
     <key>RunAtLoad</key>
     <true/>
     <key>StandardOutPath</key>
@@ -673,7 +696,7 @@ def _install_daemon() -> None:
                            capture_output=True, check=False)
             subprocess.run(["launchctl", "load", "-w", plist_path],
                            capture_output=True, check=True)
-            print(f"[postcar] daemon installed: {label} (every {interval_seconds // 60} min)")
+            print(f"[postcar] daemon installed: {label} (persistent, {interval_seconds // 60} min cadence)")
             return True
         except Exception as e:
             print(f"[postcar] daemon install failed ({arg}): {e}")
@@ -701,11 +724,11 @@ def _install_daemon() -> None:
     newly_installed = []
     is_mac = platform.system() == "Darwin"
     if "check" not in already:
-        ok = _install_launchd("", "--check", 300) if is_mac else _install_cron("--check", "*/5 * * * *")
+        ok = _install_launchd("", "--check-loop", 300) if is_mac else _install_cron("--check", "*/5 * * * *")
         if ok:
             newly_installed.append("check")
     if "stress" not in already:
-        ok = _install_launchd(".stress", "--stress-check", 1800) if is_mac else _install_cron("--stress-check", "*/30 * * * *")
+        ok = _install_launchd(".stress", "--stress-check-loop", 1800) if is_mac else _install_cron("--stress-check", "*/30 * * * *")
         if ok:
             newly_installed.append("stress")
 
@@ -3119,6 +3142,21 @@ def run() -> None:
     check_upgrade()
 
 
+def _persistent_loop(work_fn, interval_seconds: int, label: str) -> None:
+    """Run work_fn() forever, sleeping interval_seconds between calls -- used
+    by --check-loop/--stress-check-loop (see _install_daemon and the CLI
+    dispatch below). A bad cycle is caught and logged, not left to crash the
+    process: KeepAlive's restart-on-crash should catch genuine unrecoverable
+    failures, not a routine transient error on one cycle (which would also
+    lose the in-process embedding-model cache for no reason)."""
+    while True:
+        try:
+            work_fn()
+        except Exception as e:
+            print(f"    [postcar] {label} cycle failed: {e}")
+        time.sleep(interval_seconds)
+
+
 # ── CLI direct-fire ───────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -3161,6 +3199,36 @@ if __name__ == "__main__":
         if not (RELAY_URL and AGENT_ID and AGENT_KEY):
             sys.exit(0)
         run()
+        sys.exit(0)
+
+    # --check-loop / --stress-check-loop: persistent-process daemon modes
+    # (Mac only, see _install_daemon). A StartInterval-triggered fresh
+    # invocation depends on launchd re-scheduling promptly after the Mac
+    # wakes from sleep, which is unreliable in practice on modern macOS
+    # (observed: a 7.5h gap in .postcar_last_ran on a real fleet machine,
+    # tracing to sleep/wake, not a code bug). A persistent process under
+    # launchd's KeepAlive resumes its own loop immediately on wake instead
+    # of waiting on launchd's interval bookkeeping -- matches the same
+    # robust pattern the agentberg-starter trading scheduler already uses
+    # (run.sh's KeepAlive watchdog). One bad cycle is caught and logged
+    # rather than crashing the process, so KeepAlive's restart-on-crash
+    # stays reserved for genuine unrecoverable failures.
+    if len(sys.argv) == 2 and sys.argv[1] == "--check-loop":
+        if not (RELAY_URL and AGENT_ID and AGENT_KEY):
+            sys.exit(0)
+
+        def _check_cycle():
+            send_heartbeat("low")
+            check_inbox()
+            check_upgrade()
+
+        _persistent_loop(_check_cycle, 300, "check")
+        sys.exit(0)
+
+    if len(sys.argv) == 2 and sys.argv[1] == "--stress-check-loop":
+        if not (RELAY_URL and AGENT_ID and AGENT_KEY):
+            sys.exit(0)
+        _persistent_loop(run, 1800, "stress-check")
         sys.exit(0)
 
     if not (RELAY_URL and AGENT_ID and AGENT_KEY):
