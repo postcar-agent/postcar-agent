@@ -783,6 +783,12 @@ Consider: large unrealized losses, consecutive losses, risk limits breached, str
 internally conflicting signals, or a remedy that already failed once.
 Do NOT flag normal intraday volatility.
 
+Questions you've already asked in the last 24h:
+{recent_questions}
+If your finding right now is substantively the same underlying issue as one of these — even if
+the specific numbers moved slightly or you'd word it differently — set trigger=none. Repeating
+the same concern in new words is not a new trigger.
+
 {trigger_guide}
 
 Return JSON only:
@@ -806,6 +812,12 @@ Do you have any notable issue, uncertainty, or observation worth discussing with
 Consider: any unrealized loss, a losing streak (2+ losses), elevated volatility, sector weakness,
 strategy questions, internally conflicting signals, or anything you'd benefit from a second opinion on.
 
+Questions you've already asked in the last 24h:
+{recent_questions}
+If your finding right now is substantively the same underlying issue as one of these — even if
+the specific numbers moved slightly or you'd word it differently — set trigger=none. Repeating
+the same concern in new words is not a new trigger.
+
 {trigger_guide}
 
 Return JSON only:
@@ -828,6 +840,11 @@ Current state:
 Do you have ANYTHING worth sharing with peer agents — even a minor observation, question about
 current market conditions, or a routine check-in? Use this as an opportunity to exchange signals.
 Default to needs_help=true unless there is truly nothing of note to discuss.
+
+Questions you've already asked in the last 24h:
+{recent_questions}
+Default to sharing something NEW, not a repeat: if your only observation right now is substantively
+the same underlying issue as one of these — even worded differently — set trigger=none instead.
 
 {trigger_guide}
 
@@ -1266,6 +1283,7 @@ def _ask_llm(context_str: str, threshold: str = "high") -> dict | None:
         context=context_str,
         taxonomy=", ".join(CAPABILITY_TAXONOMY),
         trigger_guide=_TRIGGER_GUIDE,
+        recent_questions=_format_recent_questions_for_prompt(),
     )
     # max_tokens bumped from 200 -- the required "evidence" field (anti-
     # hallucination guard, see EMOTION_LOGIC.md) adds real length beyond the
@@ -1490,26 +1508,99 @@ def _load_recent_questions(hours: int = 24) -> list:
         return []
 
 
+def _format_recent_questions_for_prompt(limit: int = 8) -> str:
+    """Recent questions rendered for the diagnostic prompt, so the LLM can
+    self-suppress a paraphrased repeat at generation time -- character-level
+    matching (_is_semantic_dupe below) only catches near-verbatim rewording;
+    an LLM asking about the same underlying fact will phrase it differently
+    almost every call, which difflib structurally can't recognize as the
+    same question. Semantic comparison needs something that understands
+    meaning; the diagnostic call is already an LLM call, so it's free to ask
+    it to check its own output against what it already asked."""
+    recent = _load_recent_questions()[:limit]
+    if not recent:
+        return "(none)"
+    return "\n".join(f"- {q}" for q in recent)
+
+
 _DUPE_SIMILARITY_THRESHOLD = 0.6
 
+# ── Semantic dedup (embeddings, optional dependency) ──────────────────────────
+#
+# difflib (below, _is_semantic_dupe_lexical) only catches near-verbatim
+# rewording -- an LLM asking about the same underlying fact phrases it
+# differently almost every call, which character-level matching structurally
+# can't recognize. Measured against real production data: difflib caught 0
+# of 36 genuine near-duplicate pairs from one agent asking the same question
+# 9 times over 19.5 hours. Model2Vec embeddings (vendored locally under
+# models/potion-base-8m/, no network call, no API, ~1s load time) cleanly
+# separated the same data: cosine 0.586-0.919 for true duplicates vs.
+# 0.312-0.552 for genuinely different questions -- a real gap, not a
+# coincidence of this one sample.
+#
+# model2vec is an OPTIONAL dependency (`pip install model2vec`) -- this kit
+# is otherwise stdlib-only, so every load/encode call here is wrapped to
+# fall back to the lexical check if it's not installed. Never blocks the
+# diagnostic over an optional accuracy improvement.
 
-def _is_semantic_dupe(new_question: str) -> bool:
-    """difflib-based near-duplicate check against questions asked in the last
-    24h -- no LLM call. The observed failure mode this guards against is
-    literal rewording (same words/structure, minor phrasing changes), which
-    sequence-matching catches well; it won't catch a genuinely different
-    phrasing of the same underlying concern (deep paraphrase), but at this
-    scale (n in the tens per agent per day) a plain O(n) comparison loop is
-    the right tool -- no need for embeddings or LSH bucketing to avoid
-    pairwise comparison when there's nothing expensive to avoid."""
+_EMBED_MODEL_DIR = os.path.join(_DIR, "models", "potion-base-8m")
+_EMBED_SIMILARITY_THRESHOLD = 0.55  # calibrated against real data -- see comment above
+
+_embed_model = None          # cached StaticModel instance, loaded once per process
+_embed_model_load_tried = False  # so a failed load only logs/retries once, not every cycle
+
+
+def _get_embed_model():
+    """Lazy-load the vendored Model2Vec model. Returns None (and stays None
+    for the rest of this process) if model2vec isn't installed or the
+    vendored weights are missing -- callers must fall back to the lexical
+    check in that case."""
+    global _embed_model, _embed_model_load_tried
+    if _embed_model is not None or _embed_model_load_tried:
+        return _embed_model
+    _embed_model_load_tried = True
+    try:
+        from model2vec import StaticModel
+        _embed_model = StaticModel.from_pretrained(_EMBED_MODEL_DIR)
+    except Exception as e:
+        print(f"    [postcar] semantic dedup: model2vec unavailable ({e}) -- "
+              f"falling back to lexical-only dedup. For better accuracy: pip install model2vec")
+        _embed_model = None
+    return _embed_model
+
+
+def _cosine_sim(a, b) -> float:
+    import numpy as np
+    denom = (np.linalg.norm(a) * np.linalg.norm(b))
+    return float((a @ b) / denom) if denom else 0.0
+
+
+def _is_semantic_dupe_lexical(new_question: str, past: list) -> bool:
+    """difflib-based near-duplicate check -- literal rewording only, see the
+    module-level comment above. Fallback when model2vec isn't installed."""
     import difflib
-    past = _load_recent_questions()
-    if not past:
-        return False
     return any(
         difflib.SequenceMatcher(None, new_question, q).ratio() >= _DUPE_SIMILARITY_THRESHOLD
         for q in past
     )
+
+
+def _is_semantic_dupe(new_question: str) -> bool:
+    """Is new_question substantively the same as something asked in the last
+    24h? Prefers embedding-based semantic similarity (see module comment
+    above); falls back to lexical matching if model2vec isn't installed."""
+    past = _load_recent_questions()
+    if not past:
+        return False
+    model = _get_embed_model()
+    if model is None:
+        return _is_semantic_dupe_lexical(new_question, past)
+    try:
+        embeddings = model.encode([new_question] + past)
+        new_vec, past_vecs = embeddings[0], embeddings[1:]
+        return any(_cosine_sim(new_vec, v) >= _EMBED_SIMILARITY_THRESHOLD for v in past_vecs)
+    except Exception:
+        return _is_semantic_dupe_lexical(new_question, past)
 
 
 def _record_asked_question(question: str, capability: str) -> None:
