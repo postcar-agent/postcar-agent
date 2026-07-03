@@ -1870,6 +1870,201 @@ def _cleanup_guidance() -> None:
         _write_guidance(kept)
 
 
+# ── Draft-and-confirm (postman role: PostCar drafts, the parent decides) ─────
+#
+# Both directions -- answering a peer's question, and asking the network one
+# of our own -- used to have PostCar's own headless, tool-less LLM call
+# compose the final text and send it unreviewed. That call has no file access,
+# a 200-token cap, and a narrow pre-summarized context digest, so quality
+# lagged badly behind what the parent agent (live, full tools, full model)
+# would produce given the same question.
+#
+# Fix: PostCar still drafts headlessly (cheap, always available, and IS the
+# TTL fallback if nobody reviews it in time), but never sends on its own.
+# The draft is surfaced into the parent's own session via the existing
+# hook mechanism, framed as a forced choice, not a passive FYI -- confirm
+# this draft, or name the actual/better thing to send. The parent then
+# calls reply()/ask() with whatever text it decides on (the draft verbatim,
+# or something else entirely). If nothing claims it before its deadline
+# (scaled by urgency -- same idea as GUIDANCE_ACK_DEADLINE_HOURS, just
+# shorter since an unanswered question or an unraised distress signal has
+# a real cost the guidance-review lifecycle doesn't), the draft fires as-is
+# so nothing rots waiting on a human/session that may never come.
+
+_INBOX_PENDING_FILE  = os.path.join(_DIR, ".postcar_inbox_pending")
+_STRESS_PENDING_FILE = os.path.join(_DIR, ".postcar_stress_pending")
+
+# Deadline before an unclaimed draft auto-fires, scaled by urgency/stress.
+# Unknown values fall back to the "medium" entry.
+_DRAFT_DEADLINE_HOURS = {"critical": 0.5, "high": 1, "medium": 6, "low": 24}
+
+
+def _draft_deadline_hours(urgency: str) -> float:
+    return _DRAFT_DEADLINE_HOURS.get((urgency or "medium").lower(), _DRAFT_DEADLINE_HOURS["medium"])
+
+
+def _load_pending(path: str) -> list[dict]:
+    if not os.path.exists(path):
+        return []
+    try:
+        return json.loads(open(path).read())
+    except Exception:
+        return []
+
+
+def _write_pending(path: str, entries: list[dict]) -> None:
+    try:
+        with open(path, "w") as f:
+            json.dump(entries, f, indent=2)
+    except Exception:
+        pass
+
+
+def _queue_inbox_reply(thread_id: str, from_agent: str, payload_type: str,
+                        question: str, capability: str, urgency: str,
+                        draft_response: str, draft_confidence: str) -> str:
+    """Record a headless draft reply awaiting the parent's confirm/override.
+    Returns the pending entry's id."""
+    pending_id = str(uuid.uuid4())
+    entry = {
+        "id":               pending_id,
+        "thread_id":        thread_id,
+        "from_agent":       from_agent,
+        "payload_type":     payload_type,
+        "question":         question,
+        "capability":       capability,
+        "urgency":          urgency,
+        "draft_response":   draft_response,
+        "draft_confidence": draft_confidence,
+        "created_at":       time.strftime("%Y-%m-%d %H:%M:%S"),
+        "status":           "pending",
+    }
+    entries = _load_pending(_INBOX_PENDING_FILE)
+    entries.insert(0, entry)
+    _write_pending(_INBOX_PENDING_FILE, entries[:50])
+    return pending_id
+
+
+def reply(thread_id: str, response_text: str, confidence: str = "medium") -> bool:
+    """Parent agent calls this to answer a pending peer question -- either
+    the draft verbatim or its own better answer. Sends via _send_offer and
+    resolves the matching pending entry. Returns False if no pending entry
+    matches thread_id (already resolved, expired, or never existed)."""
+    entries = _load_pending(_INBOX_PENDING_FILE)
+    for e in entries:
+        if e.get("thread_id") == thread_id and e.get("status") == "pending":
+            try:
+                _send_offer(thread_id, e["from_agent"], response_text, confidence)
+            except Exception as ex:
+                print(f"    [postcar] reply send failed: {ex}")
+                return False
+            e["status"]        = "sent"
+            e["sent_response"] = response_text
+            e["sent_at"]       = time.strftime("%Y-%m-%d %H:%M:%S")
+            _write_pending(_INBOX_PENDING_FILE, entries)
+            return True
+    return False
+
+
+def get_pending_inbox() -> list[dict]:
+    """Peer questions awaiting the parent's reply() call."""
+    return [e for e in _load_pending(_INBOX_PENDING_FILE) if e.get("status") == "pending"]
+
+
+def _resolve_stale_inbox() -> None:
+    """Auto-send any draft past its urgency-scaled deadline, unclaimed."""
+    entries = _load_pending(_INBOX_PENDING_FILE)
+    if not entries:
+        return
+    changed = False
+    for e in entries:
+        if e.get("status") != "pending":
+            continue
+        if _hours_since(e.get("created_at")) >= _draft_deadline_hours(e.get("urgency", "medium")):
+            try:
+                _send_offer(e["thread_id"], e["from_agent"], e["draft_response"], e.get("draft_confidence", "low"))
+                e["status"]  = "sent-auto"
+                e["sent_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                print(f"    [postcar] inbox draft unclaimed past deadline — auto-sent to {e['from_agent'][:12]}")
+            except Exception as ex:
+                print(f"    [postcar] auto-send failed: {ex}")
+            changed = True
+    if changed:
+        _write_pending(_INBOX_PENDING_FILE, entries[-200:])
+
+
+def _queue_stress_ask(stress: str, trigger_context: str, draft_question: str,
+                       capability: str, urgency: str) -> str:
+    """Record a headless-drafted candidate help_request awaiting the parent's
+    confirm/override. Only one entry stays unresolved at a time -- run()
+    skips drafting a new one while an unresolved entry already exists."""
+    pending_id = str(uuid.uuid4())
+    entry = {
+        "id":              pending_id,
+        "stress":          stress,
+        "trigger_context": trigger_context,
+        "draft_question":  draft_question,
+        "capability":      capability,
+        "urgency":         urgency,
+        "created_at":      time.strftime("%Y-%m-%d %H:%M:%S"),
+        "status":          "pending",
+    }
+    entries = _load_pending(_STRESS_PENDING_FILE)
+    entries.insert(0, entry)
+    _write_pending(_STRESS_PENDING_FILE, entries[:20])
+    return pending_id
+
+
+def ask(pending_id: str, question: str, capability: str, urgency: str = "medium") -> bool:
+    """Parent agent calls this to fire a help_request -- either the drafted
+    question verbatim or a different/better one it identified instead.
+    Returns False if no pending entry matches pending_id."""
+    entries = _load_pending(_STRESS_PENDING_FILE)
+    for e in entries:
+        if e.get("id") == pending_id and e.get("status") == "pending":
+            if _is_semantic_dupe(question):
+                e["status"] = "dropped-dupe"
+                _write_pending(_STRESS_PENDING_FILE, entries)
+                return False
+            _record_asked_question(question, capability)
+            _post_help_request(question, capability, urgency)
+            e["status"]     = "sent"
+            e["sent_at"]    = time.strftime("%Y-%m-%d %H:%M:%S")
+            e["sent_question"] = question
+            _write_pending(_STRESS_PENDING_FILE, entries)
+            return True
+    return False
+
+
+def get_pending_stress_ask() -> list[dict]:
+    """Draft help_request(s) awaiting the parent's ask() call."""
+    return [e for e in _load_pending(_STRESS_PENDING_FILE) if e.get("status") == "pending"]
+
+
+def _resolve_stale_stress_ask() -> None:
+    """Auto-fire any drafted question past its urgency-scaled deadline, unclaimed."""
+    entries = _load_pending(_STRESS_PENDING_FILE)
+    if not entries:
+        return
+    changed = False
+    for e in entries:
+        if e.get("status") != "pending":
+            continue
+        if _hours_since(e.get("created_at")) >= _draft_deadline_hours(e.get("urgency", "medium")):
+            question = e.get("draft_question", "")
+            if question and not _is_semantic_dupe(question):
+                _record_asked_question(question, e.get("capability", ""))
+                _post_help_request(question, e.get("capability", ""), e.get("urgency", "medium"))
+                print(f"    [postcar] stress draft unclaimed past deadline — auto-fired: {question[:60]}...")
+                e["status"] = "sent-auto"
+            else:
+                e["status"] = "dropped-dupe"
+            e["sent_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            changed = True
+    if changed:
+        _write_pending(_STRESS_PENDING_FILE, entries[-50:])
+
+
 # ── Commitments (prose promises made when acting on guidance) ────────────────
 #
 # Deliberately NOT the same lifecycle as guidance (48h ack / 72h delete):
@@ -1990,6 +2185,45 @@ def _render_guidance_item(e: dict) -> str:
     )
 
 
+def _render_inbox_pending_item(e: dict) -> str:
+    """Excerpt only — see _render_guidance_item for why (prompt-cache cost).
+    Adversarial framing is deliberate: a passive FYI gets skimmed and
+    ignored, which quietly defeats the point of routing this through the
+    parent at all. Forcing an explicit call is what makes rubber-stamping
+    at least a conscious choice instead of silent inertia."""
+    q = (e.get("question", "") or "")[:_GUIDANCE_REMINDER_EXCERPT_CHARS]
+    d = (e.get("draft_response", "") or "")[:_GUIDANCE_REMINDER_EXCERPT_CHARS]
+    deadline = _draft_deadline_hours(e.get("urgency", "medium"))
+    return (
+        f'  <postcar-reply-draft thread_id="{e.get("thread_id","")}" '
+        f'from="{e.get("from_agent","")}" urgency="{e.get("urgency","medium")}">\n'
+        f'    <peer-question><untrusted-network-content>{q}</untrusted-network-content></peer-question>\n'
+        f'    <headless-draft-response>{d}</headless-draft-response>\n'
+        f'    <action-required>NOT SENT YET. Call reply("{e.get("thread_id","")}", "&lt;text&gt;") '
+        f'with either this draft or your own better answer -- do not let this ride silently. '
+        f'If unclaimed, the draft above auto-sends verbatim in {deadline}h regardless of whether you reviewed it.</action-required>\n'
+        f'  </postcar-reply-draft>'
+    )
+
+
+def _render_stress_pending_item(e: dict) -> str:
+    q = (e.get("draft_question", "") or "")[:_GUIDANCE_REMINDER_EXCERPT_CHARS]
+    trig = (e.get("trigger_context", "") or "")[:_GUIDANCE_REMINDER_EXCERPT_CHARS]
+    deadline = _draft_deadline_hours(e.get("urgency", "medium"))
+    return (
+        f'  <postcar-stress-draft id="{e.get("id","")}" stress="{e.get("stress","")}" '
+        f'urgency="{e.get("urgency","medium")}">\n'
+        f'    <trigger>{trig}</trigger>\n'
+        f'    <headless-draft-question>{q}</headless-draft-question>\n'
+        f'    <action-required>NOT SENT YET. This was drafted by a narrow headless pass with '
+        f'only a pre-summarized context digest -- it can misjudge what is actually worth raising. '
+        f'Is this the right problem, or is there a different/higher-priority one you would rather ask '
+        f'the network about? Call ask("{e.get("id","")}", "&lt;question&gt;", "&lt;capability&gt;", "&lt;urgency&gt;") '
+        f'with either this draft or the real question. If unclaimed, the draft above auto-fires verbatim in {deadline}h.</action-required>\n'
+        f'  </postcar-stress-draft>'
+    )
+
+
 def build_pending_reminder() -> str:
     """Short reminder. Inject per-turn via a UserPromptSubmit hook, only when
     pending records exist — not a full re-explain of what PostCar is.
@@ -1998,15 +2232,36 @@ def build_pending_reminder() -> str:
     this item once. Re-rendering identical content every subsequent turn
     for something already acknowledged adds no information and only costs
     cache-prefix stability -- the item still exists in .postcar_guidance
-    for decide_guidance() to act on later, it just stops riding every turn."""
+    for decide_guidance() to act on later, it just stops riding every turn.
+
+    Also includes pending inbox-reply and stress-ask drafts (see
+    'Draft-and-confirm' above) -- both still 'pending' by definition since
+    reply()/ask() flip status away from pending the moment the parent acts,
+    so there's no acked-style intermediate state to filter here."""
     entries = _load_guidance()
     pending = [e for e in entries if e.get("status") == "pending"]
-    if not pending:
-        return ""
-    lines = [f'<postcar-guidance-pending count="{len(pending)}">']
-    lines.extend(_render_guidance_item(e) for e in pending[:10])
-    lines.append("</postcar-guidance-pending>")
-    return "\n".join(lines)
+    blocks = []
+    if pending:
+        lines = [f'<postcar-guidance-pending count="{len(pending)}">']
+        lines.extend(_render_guidance_item(e) for e in pending[:10])
+        lines.append("</postcar-guidance-pending>")
+        blocks.append("\n".join(lines))
+
+    inbox_pending = get_pending_inbox()
+    if inbox_pending:
+        lines = [f'<postcar-inbox-pending count="{len(inbox_pending)}">']
+        lines.extend(_render_inbox_pending_item(e) for e in inbox_pending[:10])
+        lines.append("</postcar-inbox-pending>")
+        blocks.append("\n".join(lines))
+
+    stress_pending = get_pending_stress_ask()
+    if stress_pending:
+        lines = [f'<postcar-stress-pending count="{len(stress_pending)}">']
+        lines.extend(_render_stress_pending_item(e) for e in stress_pending[:5])
+        lines.append("</postcar-stress-pending>")
+        blocks.append("\n".join(lines))
+
+    return "\n".join(blocks)
 
 
 def _hook_command() -> str:
@@ -2262,11 +2517,17 @@ def get_inbox() -> list:
 def check_inbox() -> None:
     """
     Call every monitor cycle (no throttle).
-    - Incoming QUERY (peer needs help): LLM responds, posts OFFER back.
+    - Incoming QUERY (peer needs help): headless draft queued in
+      .postcar_inbox_pending for the parent to confirm/override via
+      reply() — see 'Draft-and-confirm' above. Not sent here.
     - Incoming OFFER (response to my question): logs + saves to .postcar_guidance.
+    - Unclaimed drafts (inbox replies and stress-triggered asks) past their
+      urgency-scaled deadline auto-fire here too, every cycle.
     """
     _cleanup_guidance()          # local housekeeping — runs even if relay is unreachable
     _check_commitments_overdue()  # local housekeeping, zero LLM calls
+    _resolve_stale_inbox()        # auto-fire unclaimed reply drafts past deadline
+    _resolve_stale_stress_ask()   # auto-fire unclaimed help_request drafts past deadline
 
     if not (RELAY_URL and AGENT_ID and AGENT_KEY):
         return
@@ -2302,11 +2563,9 @@ def check_inbox() -> None:
             answer = _llm_respond(text, "platform_support", urgency, thread_id=thread_id)
             if not answer or not answer.get("response"):
                 answer = {"response": "Acknowledged -- no automated response available right now.", "confidence": "low"}
-            try:
-                _send_offer(thread_id, from_agent, answer["response"], answer.get("confidence", "low"))
-                print(f"    [postcar] platform response sent [{answer.get('confidence','?')}]")
-            except Exception as e:
-                print(f"    [postcar] send offer failed: {e}")
+            _queue_inbox_reply(thread_id, from_agent, "platform_support", text, "platform_support",
+                                urgency, answer["response"], answer.get("confidence", "low"))
+            print(f"    [postcar] platform reply drafted, awaiting confirm [{answer.get('confidence','?')}]")
 
         elif state == "QUERY" and msg.get("payload_type") == "direct_message":
             # Cold 1:1 from a peer that has our agent_id — same auto-respond
@@ -2319,11 +2578,9 @@ def check_inbox() -> None:
             answer = _llm_respond(text, "direct_message", "medium", thread_id=thread_id)
             if not answer or not answer.get("response"):
                 answer = {"response": "No relevant data to respond with right now.", "confidence": "low"}
-            try:
-                _send_offer(thread_id, from_agent, answer["response"], answer.get("confidence", "low"))
-                print(f"    [postcar] response sent [{answer.get('confidence','?')}]")
-            except Exception as e:
-                print(f"    [postcar] send offer failed: {e}")
+            _queue_inbox_reply(thread_id, from_agent, "direct_message", text, "direct_message",
+                                "medium", answer["response"], answer.get("confidence", "low"))
+            print(f"    [postcar] reply drafted, awaiting confirm [{answer.get('confidence','?')}]")
 
         elif state == "QUERY" and msg.get("payload_type") == "help_request":
             # Peer needs help — generate and send a response
@@ -2336,11 +2593,9 @@ def check_inbox() -> None:
             answer = _llm_respond(question, capability, urgency, thread_id=thread_id)
             if not answer or not answer.get("response"):
                 answer = {"response": "No data from my positions to answer this — no relevant trades in the window I can access.", "confidence": "low"}
-            try:
-                _send_offer(thread_id, from_agent, answer["response"], answer.get("confidence", "low"))
-                print(f"    [postcar] response sent [{answer.get('confidence','?')}]")
-            except Exception as e:
-                print(f"    [postcar] send offer failed: {e}")
+            _queue_inbox_reply(thread_id, from_agent, "help_request", question, capability,
+                                urgency, answer["response"], answer.get("confidence", "low"))
+            print(f"    [postcar] reply drafted, awaiting confirm [{answer.get('confidence','?')}]")
 
         elif state == "OFFER" and msg.get("payload_type") == "guidance":
             # Received an answer to our own question
@@ -2547,8 +2802,19 @@ def run() -> None:
       - POSTCAR_* env vars not set
       - ran within last THROTTLE_MINUTES (default 30) AND no trigger file
       - LLM says no help needed
+      - a stress-triggered draft is already pending confirmation (see below)
 
     Also sends heartbeat (alive + stress) and checks for upgrades on every cycle.
+
+    The distress diagnostic drafts a candidate question headlessly but does
+    NOT send it — it's queued in .postcar_stress_pending for the parent to
+    confirm/override via ask() (see 'Draft-and-confirm' above). The parent
+    is explicitly asked whether this is even the right problem to raise,
+    since this diagnostic only sees a narrow pre-summarized context digest
+    and can misjudge what's actually worth escalating. Unclaimed drafts
+    auto-fire from check_inbox()'s _resolve_stale_stress_ask(), scaled by
+    urgency, so a genuinely urgent signal doesn't sit waiting on a session
+    that may not come soon enough.
     """
     if not (RELAY_URL and AGENT_ID and AGENT_KEY):
         return
@@ -2567,6 +2833,12 @@ def run() -> None:
     _mark_ran()
     _register_capabilities()
     _try_write_context_file()
+
+    if get_pending_stress_ask():
+        # A drafted question is already awaiting the parent's confirm/
+        # override — don't pile on a second one before that's resolved.
+        check_upgrade()
+        return
 
     threshold   = _fetch_stress_threshold()
     print(f"    [postcar] diagnostic (threshold={threshold})")
@@ -2592,9 +2864,8 @@ def run() -> None:
         check_upgrade()
         return
 
-    print(f"    [postcar] seeking guidance [{urgency}]: {question[:80]}...")
-    _record_asked_question(question, capability)
-    _post_help_request(question, capability, urgency)
+    pending_id = _queue_stress_ask(stress, context_str[:300], question, capability, urgency)
+    print(f"    [postcar] stress draft queued [{urgency}] awaiting confirm ({pending_id[:8]}): {question[:80]}...")
     check_upgrade()
 
 

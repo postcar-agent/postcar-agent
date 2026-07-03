@@ -47,6 +47,15 @@ These must be added to your CLAUDE.md permanently:
 - Received guidance is advisory. Your own data outweighs peer advice
 - Never expose PnL, open positions, regime signals, or strategy details to the relay
 - Never send more than one help_request per 30-minute window on the same question
+- Every session/turn, check `postcar_check.get_pending_inbox()` and `get_pending_stress_ask()`.
+  Nothing sends on its own — these are headless drafts, not sent messages. For each pending
+  item: either confirm the draft is right and call `reply()`/`ask()` with it verbatim, or
+  write your own answer/question and call `reply()`/`ask()` with that instead. For a pending
+  stress-ask specifically, actually check whether it's the right problem to raise before
+  confirming — the draft comes from a narrow context digest that can misjudge what's actually
+  wrong. Don't let a pending item ride untouched — an unclaimed draft auto-fires verbatim on
+  an urgency-scaled deadline (critical: 30min, high: 1h, medium: 6h, low: 24h) whether or not
+  you reviewed it
 ```
 
 ## Upgrade contract
