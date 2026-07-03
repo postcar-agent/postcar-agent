@@ -2874,11 +2874,23 @@ def check_upgrade() -> None:
     live inside a git working copy of that repo (the standard onboarding
     path: `git clone https://github.com/postcar-agent/postcar-agent.git postcar`).
 
-    One `git pull` picks up ANY changed file in the repo (postcar_check.py,
+    One fetch+merge picks up ANY changed file in the repo (postcar_check.py,
     postcar_tag_taxonomy.py, anything added later) -- no per-file download/compile-
     test/swap logic to write or maintain, and `--ff-only` refuses to clobber
     anything if this working copy was ever hand-edited, rather than silently
     overwriting local changes the way a raw byte-swap would have.
+
+    Uses explicit `git fetch` + `git merge --ff-only origin/<branch>` rather
+    than plain `git pull --ff-only`. A first-run failure was observed in the
+    wild ("fatal: Cannot fast-forward to multiple branches") -- caused by
+    branch.<name>.merge in .git/config having more than one entry, which
+    some onboarding paths outside this repo apparently leave behind. `git
+    pull` resolves its merge target through that config and can't cope with
+    it being ambiguous; naming the exact ref to merge sidesteps the lookup
+    entirely regardless of what's in local config, and still refuses to
+    clobber a genuinely diverged working copy the same way --ff-only always
+    did (verified against both a misconfigured-but-clean repro and a
+    genuinely-diverged one).
 
     If this file isn't inside a git working copy (an old single-file install
     that hasn't migrated to the git-clone onboarding path), this silently
@@ -2893,12 +2905,25 @@ def check_upgrade() -> None:
             ["git", "-C", own_dir, "rev-parse", "HEAD"],
             capture_output=True, text=True, timeout=10,
         ).stdout.strip()
+        branch = subprocess.run(
+            ["git", "-C", own_dir, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        if not branch or branch == "HEAD":
+            return  # detached HEAD -- no branch to fast-forward, don't guess
+        fetch = subprocess.run(
+            ["git", "-C", own_dir, "fetch", "origin", branch],
+            capture_output=True, text=True, timeout=30,
+        )
+        if fetch.returncode != 0:
+            print(f"    [postcar] git fetch failed: {(fetch.stderr or fetch.stdout).strip()[:200]}")
+            return
         result = subprocess.run(
-            ["git", "-C", own_dir, "pull", "--ff-only"],
+            ["git", "-C", own_dir, "merge", "--ff-only", f"origin/{branch}"],
             capture_output=True, text=True, timeout=30,
         )
         if result.returncode != 0:
-            print(f"    [postcar] git pull failed: {(result.stderr or result.stdout).strip()[:200]}")
+            print(f"    [postcar] git merge --ff-only failed: {(result.stderr or result.stdout).strip()[:200]}")
             return
         after = subprocess.run(
             ["git", "-C", own_dir, "rev-parse", "HEAD"],
