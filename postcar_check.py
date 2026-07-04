@@ -32,7 +32,6 @@ SETUP:
   2. Add to check_positions() — last lines:
        import postcar_check
        postcar_check.check_inbox()
-       postcar_check.run()
 
 No credentials, no config file needed -- auto-registration + scheduler
 install happen on first import. See README.md.
@@ -42,6 +41,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import sys
 import time
 import uuid
@@ -1078,32 +1078,152 @@ _LLM_MINIMAL_TOOLS_ARGS = {
 }
 
 
+# ── Local LLM call log (input/output/cache tokens per call) ──────────────────
+#
+# Postcar's own LLM calls (tag classification, guidance evaluation, semantic
+# dedup, inbox drafting) had zero local telemetry -- the only visibility into
+# their cost was inferring it from the parent Claude Code session's own
+# usage.db, which conflates postcar's calls with everything else in that
+# session and can't be isolated from it. This is ground truth for postcar's
+# own calls specifically, one row per call, kept locally per agent.
+#
+# Token/cache columns are only populated for the `api` provider (OpenAI-
+# compatible chat completions -- resp.usage is real, though whether
+# cache_read/cache_creation are populated at all is provider-dependent). CLI
+# providers (claude/codex/agy) return plain text with no structured usage in
+# their output -- char counts and latency are still logged for those, but
+# token/cache columns stay NULL rather than guessing at a number.
+
+_LLM_CALLS_DB = os.path.join(_DIR, ".postcar_llm_calls.db")
+
+
+def _llm_calls_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(_LLM_CALLS_DB)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS llm_calls (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp             TEXT NOT NULL,
+            label                 TEXT,
+            provider              TEXT,
+            model                 TEXT,
+            success               INTEGER NOT NULL,
+            latency_ms            INTEGER,
+            prompt_chars          INTEGER,
+            response_chars        INTEGER,
+            input_tokens          INTEGER,
+            output_tokens         INTEGER,
+            cache_read_tokens     INTEGER,
+            cache_creation_tokens INTEGER
+        )
+    """)
+    return conn
+
+
+def _log_llm_call(label: str, provider: str, model: str, prompt: str,
+                   response_text: str, latency_ms: int, success: bool,
+                   usage: dict | None = None) -> None:
+    """Best-effort -- local telemetry must never block or fail the actual call."""
+    try:
+        usage = usage or {}
+        conn = _llm_calls_conn()
+        conn.execute(
+            """INSERT INTO llm_calls
+               (timestamp, label, provider, model, success, latency_ms,
+                prompt_chars, response_chars, input_tokens, output_tokens,
+                cache_read_tokens, cache_creation_tokens)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                time.strftime("%Y-%m-%d %H:%M:%S"), label, provider, model,
+                1 if success else 0, latency_ms,
+                len(prompt or ""), len(response_text or ""),
+                usage.get("input_tokens"), usage.get("output_tokens"),
+                usage.get("cache_read_tokens"), usage.get("cache_creation_tokens"),
+            ),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+def get_llm_call_log(limit: int = 50) -> list[dict]:
+    """Most recent postcar LLM calls, newest first."""
+    try:
+        conn = _llm_calls_conn()
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM llm_calls ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def get_llm_call_stats(hours: int = 24) -> dict:
+    """Aggregate call count/failures/tokens over the last N hours."""
+    cutoff = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - hours * 3600))
+    keys = ["calls", "failures", "input_tokens", "output_tokens",
+            "cache_read_tokens", "cache_creation_tokens"]
+    try:
+        conn = _llm_calls_conn()
+        row = conn.execute(
+            """SELECT COUNT(*), SUM(CASE WHEN success=0 THEN 1 ELSE 0 END),
+                      SUM(input_tokens), SUM(output_tokens),
+                      SUM(cache_read_tokens), SUM(cache_creation_tokens)
+               FROM llm_calls WHERE timestamp >= ?""",
+            (cutoff,),
+        ).fetchone()
+        conn.close()
+        return dict(zip(keys, row))
+    except Exception:
+        return dict(zip(keys, [0, 0, 0, 0, 0, 0]))
+
+
 def _call_llm(prompt: str, label: str = "llm", max_tokens: int = 400, minimal_tools: bool = False) -> dict | None:
     """Call the parent agent's configured LLM exactly once. No fallback to a
     different provider on failure — log why and return None instead.
 
     minimal_tools=True strips tool-schema loading for pure classification
     calls that never invoke any tool (guidance evaluation, duplicate-question
-    check, the distress diagnostic) -- see _LLM_MINIMAL_TOOLS_ARGS."""
+    check, the distress diagnostic) -- see _LLM_MINIMAL_TOOLS_ARGS.
+
+    Every call, success or failure, is recorded locally via _log_llm_call()
+    -- see the section above for what's actually captured per provider."""
     provider = _llm_provider()
+    model = _llm_model()
 
     if provider == "api":
         api_key = _llm_api_key()
         if not api_key:
             print(f"    [postcar] {label} error: POSTCAR_LLM_PROVIDER=api but no API key found")
             return None
+        started = time.monotonic()
         try:
             from openai import OpenAI
             client = OpenAI(api_key=api_key, base_url=_llm_base_url())
             resp = client.chat.completions.create(
-                model=_llm_model(),
+                model=model,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=max_tokens,
                 temperature=0.1,
             )
-            return _extract_json(resp.choices[0].message.content.strip())
+            text = resp.choices[0].message.content.strip()
+            parsed = _extract_json(text)
+            usage_obj = getattr(resp, "usage", None)
+            cached = getattr(getattr(usage_obj, "prompt_tokens_details", None), "cached_tokens", None)
+            usage = {
+                "input_tokens":  getattr(usage_obj, "prompt_tokens", None),
+                "output_tokens": getattr(usage_obj, "completion_tokens", None),
+                "cache_read_tokens": cached,
+            } if usage_obj is not None else None
+            _log_llm_call(label, provider, model, prompt, text,
+                          int((time.monotonic() - started) * 1000), True, usage)
+            return parsed
         except Exception as e:
             print(f"    [postcar] {label} error (api): {e}")
+            _log_llm_call(label, provider, model, prompt, "",
+                          int((time.monotonic() - started) * 1000), False)
             return None
 
     bins = _llm_cli_bins(provider)
@@ -1112,6 +1232,7 @@ def _call_llm(prompt: str, label: str = "llm", max_tokens: int = 400, minimal_to
         args = args + _LLM_MINIMAL_TOOLS_ARGS.get(provider, [])
 
     for binary in bins:
+        started = time.monotonic()
         try:
             result = _subprocess.run(
                 [binary] + args,
@@ -1122,13 +1243,19 @@ def _call_llm(prompt: str, label: str = "llm", max_tokens: int = 400, minimal_to
             continue  # try the next known path for this same tool, not a different tool
         except Exception as e:
             print(f"    [postcar] {label} error ({provider}): {e}")
+            _log_llm_call(label, provider, model, prompt, "",
+                          int((time.monotonic() - started) * 1000), False)
             return None
+        latency_ms = int((time.monotonic() - started) * 1000)
         if result.returncode != 0:
             print(f"    [postcar] {label} error ({provider}): exit {result.returncode}: {(result.stderr or '').strip()[:200]}")
+            _log_llm_call(label, provider, model, prompt, result.stdout or "", latency_ms, False)
             return None
         parsed = _extract_json((result.stdout or "").strip())
         if parsed is None:
             print(f"    [postcar] {label} error ({provider}): no JSON found in output")
+        _log_llm_call(label, provider, model, prompt, result.stdout or "",
+                      latency_ms, parsed is not None)
         return parsed
 
     print(f"    [postcar] {label} error: '{provider}' binary not found in any known path")
