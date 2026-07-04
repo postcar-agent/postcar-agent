@@ -983,10 +983,22 @@ _LLM_CLI_KNOWN_BINS = {
     "codex":  ["codex", os.path.expanduser("~/.local/bin/codex")],
 }
 _LLM_CLI_KNOWN_ARGS = {
-    "claude": ["--print", "--output-format", "text", "--safe-mode"],
+    # claude: --output-format json (not text) -- the CLI's json envelope
+    # carries real usage (input/output/cache tokens, see _parse_cli_result)
+    # that plain text mode discards entirely. Verified against a live
+    # `claude --print --output-format json` call: single JSON object on
+    # stdout, `result` field holds the actual model output, `usage` field
+    # holds input_tokens/output_tokens/cache_read_input_tokens/
+    # cache_creation_input_tokens. agy has no equivalent flag (checked
+    # `agy --help` -- no --output-format/json option at all); codex not
+    # verified (not installed on this machine) so left as plain text.
+    "claude": ["--print", "--output-format", "json", "--safe-mode"],
     "agy":    [],
     "codex":  ["--full-auto"],
 }
+# Providers whose CLI output is a JSON envelope wrapping the real response
+# (see _parse_cli_result) rather than the raw response itself.
+_LLM_CLI_JSON_ENVELOPE = {"claude"}
 
 
 def _llm_provider() -> str:
@@ -1067,6 +1079,30 @@ def _extract_json(raw: str) -> dict | None:
         return None
 
 
+def _parse_cli_result(provider: str, stdout: str) -> tuple[dict | None, dict | None]:
+    """Returns (parsed_decision, usage). For _LLM_CLI_JSON_ENVELOPE providers,
+    stdout is one JSON envelope (`{"result": "<actual model output>", "usage":
+    {...}, ...}`) -- unwrap it first, since running _extract_json directly on
+    the envelope would parse the envelope itself (it's one balanced {...}),
+    not postcar's actual expected schema inside `result`. Other CLI providers
+    have no such envelope -- stdout is the raw response, parsed directly, no
+    usage available."""
+    if provider not in _LLM_CLI_JSON_ENVELOPE:
+        return _extract_json(stdout), None
+    try:
+        envelope = json.loads(stdout)
+    except Exception:
+        return _extract_json(stdout), None  # not actually JSON -- fall back rather than fail
+    usage_raw = envelope.get("usage") or {}
+    usage = {
+        "input_tokens":  usage_raw.get("input_tokens"),
+        "output_tokens": usage_raw.get("output_tokens"),
+        "cache_read_tokens":     usage_raw.get("cache_read_input_tokens"),
+        "cache_creation_tokens": usage_raw.get("cache_creation_input_tokens"),
+    }
+    return _extract_json(envelope.get("result", "")), usage
+
+
 # Extra args for providers whose CLI supports disabling tool-schema loading
 # entirely -- a pure classification prompt (JSON in, JSON out) never invokes
 # Bash/Read/file tools, so their schemas are pure overhead: measured ~87%
@@ -1087,12 +1123,16 @@ _LLM_MINIMAL_TOOLS_ARGS = {
 # session and can't be isolated from it. This is ground truth for postcar's
 # own calls specifically, one row per call, kept locally per agent.
 #
-# Token/cache columns are only populated for the `api` provider (OpenAI-
-# compatible chat completions -- resp.usage is real, though whether
-# cache_read/cache_creation are populated at all is provider-dependent). CLI
-# providers (claude/codex/agy) return plain text with no structured usage in
-# their output -- char counts and latency are still logged for those, but
-# token/cache columns stay NULL rather than guessing at a number.
+# Token/cache columns are populated for the `api` provider (OpenAI-compatible
+# chat completions -- resp.usage is real, though whether cache_read/
+# cache_creation are populated at all is provider-dependent) and for `claude`
+# CLI calls (--output-format json exposes real usage, see _parse_cli_result --
+# plain --output-format text discards it entirely, which is why this was
+# NULL for every fleet agent before this fix, since claude is the only
+# provider any of them actually run). agy has no equivalent CLI flag at all
+# (checked `agy --help`); codex not verified (not installed here) -- both
+# still get real char counts and latency, just NULL token/cache columns
+# rather than a guessed number.
 
 _LLM_CALLS_DB = os.path.join(_DIR, ".postcar_llm_calls.db")
 
@@ -1251,11 +1291,11 @@ def _call_llm(prompt: str, label: str = "llm", max_tokens: int = 400, minimal_to
             print(f"    [postcar] {label} error ({provider}): exit {result.returncode}: {(result.stderr or '').strip()[:200]}")
             _log_llm_call(label, provider, model, prompt, result.stdout or "", latency_ms, False)
             return None
-        parsed = _extract_json((result.stdout or "").strip())
+        parsed, usage = _parse_cli_result(provider, (result.stdout or "").strip())
         if parsed is None:
             print(f"    [postcar] {label} error ({provider}): no JSON found in output")
         _log_llm_call(label, provider, model, prompt, result.stdout or "",
-                      latency_ms, parsed is not None)
+                      latency_ms, parsed is not None, usage)
         return parsed
 
     print(f"    [postcar] {label} error: '{provider}' binary not found in any known path")
