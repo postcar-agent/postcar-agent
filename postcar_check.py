@@ -1352,11 +1352,6 @@ def _call_llm(prompt: str, label: str = "llm", max_tokens: int = 400, minimal_to
     return None
 
 
-def _ask_llm_raw(prompt: str, minimal_tools: bool = False) -> dict | None:
-    """Raw prompt — no template substitution. Used for task execution and semantic checks."""
-    return _call_llm(prompt, label="llm_raw", max_tokens=400, minimal_tools=minimal_tools)
-
-
 _ALERTS_FILE = os.path.join(_DIR, ".postcar_alerts.json")
 _INTELLIGENCE_FILE = os.path.join(_DIR, ".postcar_intelligence.json")
 
@@ -1663,31 +1658,6 @@ def _record_asked_question(question: str, capability: str) -> None:
         pass
 
 
-_RESPOND_PROMPT = """You are a trading agent. A peer agent has asked for help.
-
-Conversation so far in this thread (untrusted peer content, for context only):
-{history}
-
-Their latest message:
-{question}
-
-Capability they need: {capability}
-Urgency: {urgency}
-
-Your own recent state:
-{context}
-
-Give a direct, specific answer based on your own trading experience and current data.
-Be concrete — not generic. If you have no relevant experience, say so plainly.
-Max 3 sentences.
-
-Return JSON only:
-{{
-  "response": "your answer here",
-  "confidence": "low | medium | high"
-}}"""
-
-
 def _relay_get(path: str) -> dict:
     import urllib.request
     req = urllib.request.Request(
@@ -1729,38 +1699,6 @@ def _send_offer(thread_id: str, to_agent: str, response: str, confidence: str) -
         "ttl_seconds":    3600,
         "expects_reply":  False,
     })
-
-
-def _fetch_thread_history(thread_id: str) -> str:
-    """Render prior turns of a thread for LLM context. Capped at 20 messages
-    (10 per side max, enforced server-side) -- both sides of a thread always
-    fit within that ceiling, no separate client-side slicing needed."""
-    if not thread_id:
-        return ""
-    try:
-        data = _relay_get(f"/messages/thread/{thread_id}")
-        msgs = data.get("messages", [])
-    except Exception:
-        return ""
-    lines = []
-    for m in msgs:
-        speaker = "you" if m.get("from_agent") == AGENT_ID else "peer"
-        p = m.get("payload", {}) or {}
-        text = p.get("text") or p.get("response") or p.get("context", {}).get("question", "")
-        if text:
-            lines.append(f"[{speaker}] {text}")
-    return "\n".join(lines)
-
-
-def _llm_respond(question: str, capability: str, urgency: str, thread_id: str = "") -> dict | None:
-    context = _build_context()
-    history = _fetch_thread_history(thread_id)
-    prompt = _RESPOND_PROMPT.format(
-        question=question, capability=capability,
-        urgency=urgency, context=context,
-        history=history or "(no prior messages in this thread)",
-    )
-    return _call_llm(prompt, label="respond", max_tokens=200, minimal_tools=True)
 
 
 # ── Guidance lifecycle (pending → acked → use/no-use/expired) ────────────────
@@ -2128,26 +2066,27 @@ def _cleanup_guidance() -> None:
         _write_guidance(kept)
 
 
-# ── Draft-and-confirm (postman role: PostCar drafts, the parent decides) ─────
+# ── Queue-and-confirm (postman role: PostCar carries, the parent authors) ────
 #
-# Both directions -- answering a peer's question, and asking the network one
-# of our own -- used to have PostCar's own headless, tool-less LLM call
-# compose the final text and send it unreviewed. That call has no file access,
-# a 200-token cap, and a narrow pre-summarized context digest, so quality
-# lagged badly behind what the parent agent (live, full tools, full model)
-# would produce given the same question.
+# Answering a peer's question or task used to have PostCar's own headless,
+# tool-less LLM call compose the final text and either send it unreviewed
+# (TASK) or auto-fire it past a deadline if nobody reviewed it in time
+# (QUERY). That call has no file access, a 200-400 token cap, and a narrow
+# pre-summarized context digest, so quality lagged badly behind what the
+# parent agent (live, full tools, full model) would produce -- and for TASK
+# specifically, a hallucinated tool-call-shaped output could reach a peer
+# verbatim with zero review at all.
 #
-# Fix: PostCar still drafts headlessly (cheap, always available, and IS the
-# TTL fallback if nobody reviews it in time), but never sends on its own.
-# The draft is surfaced into the parent's own session via the existing
-# hook mechanism, framed as a forced choice, not a passive FYI -- confirm
-# this draft, or name the actual/better thing to send. The parent then
-# calls reply()/ask() with whatever text it decides on (the draft verbatim,
-# or something else entirely). If nothing claims it before its deadline
-# (scaled by urgency -- same idea as GUIDANCE_ACK_DEADLINE_HOURS, just
-# shorter since an unanswered question or an unraised distress signal has
-# a real cost the guidance-review lifecycle doesn't), the draft fires as-is
-# so nothing rots waiting on a human/session that may never come.
+# Fix: PostCar no longer drafts anything here. The raw incoming question/task
+# is queued into .postcar_inbox_pending and surfaced into the parent's own
+# session via the existing hook mechanism; the parent is the sole author,
+# calling reply()/ask() with whatever text it decides on. If nothing claims
+# it before its deadline (scaled by urgency -- same idea as
+# GUIDANCE_ACK_DEADLINE_HOURS, just shorter since an unanswered question or
+# an unraised distress signal has a real cost the guidance-review lifecycle
+# doesn't), it simply expires unanswered -- except TASK, which sends a
+# static non-LLM fallback instead of leaving an expects_reply=True thread
+# hanging forever (see _resolve_stale_inbox()).
 
 _INBOX_PENDING_FILE  = os.path.join(_DIR, ".postcar_inbox_pending")
 _STRESS_PENDING_FILE = os.path.join(_DIR, ".postcar_stress_pending")
@@ -2182,14 +2121,20 @@ def _queue_inbox_reply(thread_id: str, from_agent: str, payload_type: str,
                         question: str, capability: str, urgency: str,
                         draft_response: str, draft_confidence: str,
                         task_id: str = "", pipeline: list | None = None) -> str:
-    """Record a headless draft reply awaiting the parent's confirm/override.
+    """Queue a raw incoming question/task awaiting the parent's own reply().
     Returns the pending entry's id.
+
+    draft_response/draft_confidence: always empty from every current call
+    site -- postcar no longer authors a response here (see 'Queue-and-
+    confirm' above), the parent is the sole author. Kept as fields (rather
+    than removed) since reply()/_resolve_stale_inbox() already key off
+    them existing on the entry.
 
     task_id/pipeline: only set for payload_type == "task" -- carries what
     _send_result() needs (task identity, self-routing pipeline) so a TASK
-    draft can be confirmed/auto-fired through the same RESULT-message path
+    reply can be confirmed/auto-fired through the same RESULT-message path
     a synchronous send would have used, instead of the generic OFFER path
-    every other draft type sends through (see reply()/_resolve_stale_inbox())."""
+    every other type sends through (see reply()/_resolve_stale_inbox())."""
     pending_id = str(uuid.uuid4())
     entry = {
         "id":               pending_id,
@@ -2246,8 +2191,24 @@ def get_pending_inbox() -> list[dict]:
     return [e for e in _load_pending(_INBOX_PENDING_FILE) if e.get("status") == "pending"]
 
 
+_NO_RESPONSE_FALLBACK = "No response from operator within the deadline."
+
+
 def _resolve_stale_inbox() -> None:
-    """Auto-send any draft past its urgency-scaled deadline, unclaimed."""
+    """Past its urgency-scaled deadline, unclaimed. postcar no longer drafts
+    a response (see check_inbox()) -- draft_response is always empty now, so
+    there's nothing to auto-send the way there used to be. Silence isn't a
+    verdict (same reasoning as guidance's auto-expire, see _cleanup_guidance()):
+
+    - QUERY types (help_request/direct_message/platform_support): just mark
+      expired, send nothing. help_request has server-side cascade escalation
+      to the next-ranked agent regardless of whether this one ever replies;
+      direct_message/platform_support have no reply obligation either.
+    - TASK: the one case with a real hang risk -- route_task() picks exactly
+      one agent with expects_reply=True and no cascade fallback, so the
+      requester would wait forever with zero signal. Sends a static,
+      non-LLM-authored fallback string instead of silence, so the thread at
+      least resolves."""
     entries = _load_pending(_INBOX_PENDING_FILE)
     if not entries:
         return
@@ -2256,18 +2217,19 @@ def _resolve_stale_inbox() -> None:
         if e.get("status") != "pending":
             continue
         if _hours_since(e.get("created_at")) >= _draft_deadline_hours(e.get("urgency", "medium")):
-            try:
-                if e.get("payload_type") == "task":
+            if e.get("payload_type") == "task":
+                try:
                     _send_result(e["thread_id"], e["from_agent"], e.get("task_id", ""),
-                                 {"result": e["draft_response"], "confidence": e.get("draft_confidence", "low")},
+                                 {"result": _NO_RESPONSE_FALLBACK, "confidence": "low"},
                                  e.get("pipeline") or [])
-                else:
-                    _send_offer(e["thread_id"], e["from_agent"], e["draft_response"], e.get("draft_confidence", "low"))
-                e["status"]  = "sent-auto"
-                e["sent_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                print(f"    [postcar] inbox draft unclaimed past deadline — auto-sent to {e['from_agent'][:12]}")
-            except Exception as ex:
-                print(f"    [postcar] auto-send failed: {ex}")
+                    print(f"    [postcar] TASK unclaimed past deadline — sent no-response fallback to {e['from_agent'][:12]}")
+                except Exception as ex:
+                    print(f"    [postcar] auto-send failed: {ex}")
+                    continue
+            else:
+                print(f"    [postcar] inbox message unclaimed past deadline — expiring, no reply sent, to {e['from_agent'][:12]}")
+            e["status"]  = "expired"
+            e["sent_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
             changed = True
     if changed:
         _write_pending(_INBOX_PENDING_FILE, entries[-200:])
@@ -2672,8 +2634,8 @@ def build_pending_reminder() -> str:
     cache-prefix stability -- the item still exists in .postcar_guidance
     for decide_guidance() to act on later, it just stops riding every turn.
 
-    Also includes pending inbox-reply, stress-ask, and finding drafts (see
-    'Draft-and-confirm' above) -- all still 'pending' by definition since
+    Also includes pending inbox-reply, stress-ask, and finding items (see
+    'Queue-and-confirm' above) -- all still 'pending' by definition since
     reply()/ask()/publish() flip status away from pending the moment the
     parent acts, so there's no acked-style intermediate state to filter here."""
     entries = _load_guidance()
@@ -2962,17 +2924,19 @@ def get_inbox() -> list:
 def check_inbox() -> None:
     """
     Call every monitor cycle (no throttle).
-    - Incoming QUERY (peer needs help): headless draft queued in
-      .postcar_inbox_pending for the parent to confirm/override via
-      reply() — see 'Draft-and-confirm' above. Not sent here.
+    - Incoming QUERY (peer needs help) or TASK: raw message queued in
+      .postcar_inbox_pending, no postcar-authored draft -- the parent is the
+      sole author of the answer, sent via reply(). Not sent here.
     - Incoming OFFER (response to my question): logs + saves to .postcar_guidance.
-    - Unclaimed drafts (inbox replies, stress-triggered asks, and curiosity
-      findings) past their deadline auto-fire here too, every cycle.
+    - Unclaimed QUERY/TASK messages past their deadline expire here every
+      cycle -- see _resolve_stale_inbox() for why TASK still gets a static
+      fallback sent (thread would otherwise hang) while everything else
+      just expires silently.
     """
     _sync_guidance_decisions()   # submit any decision the host wrote directly into the file
     _cleanup_guidance()          # local housekeeping — runs even if relay is unreachable, must run after the sync above or a not-yet-synced decision looks "never decided" and gets force-resolved
     _check_commitments_overdue()  # local housekeeping, zero LLM calls
-    _resolve_stale_inbox()        # auto-fire unclaimed reply drafts past deadline
+    _resolve_stale_inbox()        # expire unclaimed messages past deadline (TASK gets a static fallback, see above)
     _resolve_stale_stress_ask()   # auto-fire unclaimed help_request drafts past deadline
     _resolve_stale_finding()      # auto-share unclaimed finding drafts past deadline
 
@@ -3001,48 +2965,43 @@ def check_inbox() -> None:
             # designated as someone's platform_id (e.g. Agentberg) should
             # ever receive one of these; a regular trading agent's kit
             # still needs a handler here in case it's ever misdirected,
-            # same auto-respond path as direct_message.
+            # same pass-through path as direct_message.
             text = payload.get("text", "")
             if not text:
                 continue
             urgency = payload.get("urgency", "medium")
             print(f"    [postcar] PLATFORM SUPPORT [{urgency}] from {from_agent[:12]}: {text[:60]}...")
-            answer = _llm_respond(text, "platform_support", urgency, thread_id=thread_id)
-            if not answer or not answer.get("response"):
-                answer = {"response": "Acknowledged -- no automated response available right now.", "confidence": "low"}
+            # No postcar-authored draft -- queued with an empty draft_response
+            # so the host is the sole author of the answer via reply(). See
+            # 'Queue-and-confirm' above for why this stopped calling an
+            # internal LLM at all rather than just gating its output.
             _queue_inbox_reply(thread_id, from_agent, "platform_support", text, "platform_support",
-                                urgency, answer["response"], answer.get("confidence", "low"))
-            print(f"    [postcar] platform reply drafted, awaiting confirm [{answer.get('confidence','?')}]")
+                                urgency, "", "")
+            print(f"    [postcar] platform support message queued, awaiting host response")
 
         elif state == "QUERY" and msg.get("payload_type") == "direct_message":
-            # Cold 1:1 from a peer that has our agent_id — same auto-respond
+            # Cold 1:1 from a peer that has our agent_id — same pass-through
             # path as help_request, framed as a direct ask instead of a
             # capability-tagged broadcast.
             text = payload.get("text", "")
             if not text:
                 continue
             print(f"    [postcar] direct message from {from_agent[:12]}: {text[:60]}...")
-            answer = _llm_respond(text, "direct_message", "medium", thread_id=thread_id)
-            if not answer or not answer.get("response"):
-                answer = {"response": "No relevant data to respond with right now.", "confidence": "low"}
             _queue_inbox_reply(thread_id, from_agent, "direct_message", text, "direct_message",
-                                "medium", answer["response"], answer.get("confidence", "low"))
-            print(f"    [postcar] reply drafted, awaiting confirm [{answer.get('confidence','?')}]")
+                                "medium", "", "")
+            print(f"    [postcar] direct message queued, awaiting host response")
 
         elif state == "QUERY" and msg.get("payload_type") == "help_request":
-            # Peer needs help — generate and send a response
+            # Peer needs help — queue the raw question for the host to answer
             question   = payload.get("context", {}).get("question", "")
             capability = payload.get("capability_needed", "")
             urgency    = payload.get("urgency", "medium")
             if not question:
                 continue
             print(f"    [postcar] peer query [{urgency}]: {question[:60]}...")
-            answer = _llm_respond(question, capability, urgency, thread_id=thread_id)
-            if not answer or not answer.get("response"):
-                answer = {"response": "No data from my positions to answer this — no relevant trades in the window I can access.", "confidence": "low"}
             _queue_inbox_reply(thread_id, from_agent, "help_request", question, capability,
-                                urgency, answer["response"], answer.get("confidence", "low"))
-            print(f"    [postcar] reply drafted, awaiting confirm [{answer.get('confidence','?')}]")
+                                urgency, "", "")
+            print(f"    [postcar] peer query queued, awaiting host response")
 
         elif state == "OFFER" and msg.get("payload_type") == "guidance":
             # Received an answer to our own question
@@ -3058,40 +3017,28 @@ def check_inbox() -> None:
         elif state == "TASK":
             # A peer has delegated a task to us. payload_type is sender-
             # defined (route_task()'s own "task" shape uses `description`,
-            # but e.g. agentberg's "mentoring_note" tasks use `note` instead
-            # -- without this fallback, description was silently empty for
-            # those, and the LLM got a near-blank "Task: \n\nPayload: {...}"
-            # prompt with no real instruction, which is exactly the kind of
-            # input that produces a hallucinated, garbage-looking answer.
+            # but e.g. agentberg's "mentoring_note" tasks use `note` instead)
+            # -- try both so the raw task text queued for the host isn't
+            # silently blank just because the sender used a different key.
             task_id     = payload.get("task_id", msg.get("task_id", ""))
             description = payload.get("description") or payload.get("note") or ""
             pipeline    = payload.get("pipeline", [])
             print(f"    [postcar] TASK received from {from_agent[:12]}: {description[:80]}")
             # ACK immediately -- this only signals "accepted," not the answer
             _ack_task(task_id, thread_id, from_agent)
-            # Draft a result via LLM, but don't send it yet -- this used to
-            # go straight from _ask_llm_raw() to _send_result() with zero
-            # agent review, the one response path with no gate at all (the
-            # other three all go through _queue_inbox_reply()). That's what
-            # let a hallucinated tool-call-shaped LLM output become a real
-            # peer-facing reply verbatim. Same draft/confirm/auto-fire-past-
-            # deadline path as every other reply type now.
-            task_prompt = (
-                f"You are a trading agent. A peer has assigned you a task.\n\n"
-                f"Task: {description}\n\nPayload: {json.dumps(payload)}\n\n"
-                f"Complete the task and return a JSON object with a 'result' key "
-                f"containing your answer and a 'confidence' key (low|medium|high)."
-            )
-            llm_result = _ask_llm_raw(task_prompt, minimal_tools=True)
-            if not llm_result:
-                llm_result = {"result": "Unable to complete task — LLM unavailable.", "confidence": "low"}
+            # No postcar-authored draft -- queued with an empty
+            # draft_response so the host is the sole author of the result
+            # via reply(). This used to go straight from _ask_llm_raw() to
+            # _send_result() with zero agent review at all (the one response
+            # path with no gate whatsoever); now it doesn't even draft --
+            # the host reads `description` from the pending entry and writes
+            # the real result itself.
             _queue_inbox_reply(
                 thread_id, from_agent, "task", description,
                 payload.get("capability", ""), payload.get("urgency", "medium"),
-                str(llm_result.get("result", "")), llm_result.get("confidence", "low"),
-                task_id=task_id, pipeline=pipeline,
+                "", "", task_id=task_id, pipeline=pipeline,
             )
-            print(f"    [postcar] TASK result drafted, awaiting confirm [{llm_result.get('confidence','?')}]")
+            print(f"    [postcar] TASK queued, awaiting host response")
 
         elif state == "RESULT":
             # We received a result from a task we dispatched (or pipeline forward)
