@@ -43,6 +43,7 @@ import json
 import os
 import sqlite3
 import sys
+import tempfile
 import time
 import uuid
 
@@ -994,15 +995,36 @@ _LLM_CLI_KNOWN_ARGS = {
     # stdout, `result` field holds the actual model output, `usage` field
     # holds input_tokens/output_tokens/cache_read_input_tokens/
     # cache_creation_input_tokens. agy has no equivalent flag (checked
-    # `agy --help` -- no --output-format/json option at all); codex not
-    # verified (not installed on this machine) so left as plain text.
+    # `agy --help` -- no --output-format/json option at all).
     "claude": ["--print", "--output-format", "json", "--safe-mode"],
     "agy":    [],
-    "codex":  ["--full-auto"],
+    # codex: verified against a live `codex exec` call (0.142.5) -- the
+    # previous `--full-auto` flag doesn't exist in current codex at all
+    # (exits 2, "unexpected argument '--full-auto' found" on every single
+    # call, unconditionally -- codex support was never actually functional).
+    # `exec` is the non-interactive subcommand; bare top-level flags forward
+    # into the INTERACTIVE cli instead. -s read-only: every postcar call
+    # site (task execution included) treats the LLM as pure prompt-in/JSON-
+    # out -- postcar never expects it to actually run shell commands or
+    # write files, and a peer-triggered TASK message getting real write/exec
+    # access on the receiving agent's machine would be a real lateral-
+    # movement risk for a network of agents that don't fully trust each
+    # other -- matches the "advisory only, never auto-executes" model the
+    # rest of this kit already commits to.
+    "codex":  ["exec", "-s", "read-only"],
 }
 # Providers whose CLI output is a JSON envelope wrapping the real response
 # (see _parse_cli_result) rather than the raw response itself.
 _LLM_CLI_JSON_ENVELOPE = {"claude"}
+# Providers whose real response has to come from a file (-o/--output-last-
+# message), not stdout -- codex's stdout is a JSONL event stream even
+# without --json (thread/turn/item lifecycle events), not a single parseable
+# response, so grabbing stdout directly the way claude/agy do would require
+# hand-parsing an event schema this kit has never verified end-to-end.
+# -o writes only the model's final message text, confirmed to not be
+# created at all when the call fails (401/timeout/etc) -- safe to treat
+# "file doesn't exist" as failure without a separate error path.
+_LLM_CLI_FILE_OUTPUT = {"codex"}
 
 
 def _llm_provider() -> str:
@@ -1283,9 +1305,16 @@ def _call_llm(prompt: str, label: str = "llm", max_tokens: int = 400, minimal_to
 
     for binary in bins:
         started = time.monotonic()
+        file_output_path = None
+        call_args = args
+        if provider in _LLM_CLI_FILE_OUTPUT:
+            fd, file_output_path = tempfile.mkstemp(prefix="postcar_llm_", suffix=".txt")
+            os.close(fd)
+            os.remove(file_output_path)  # codex must create this fresh -- a pre-existing empty file would look like a successful-but-empty response
+            call_args = args + ["-o", file_output_path]
         try:
             result = _subprocess.run(
-                [binary] + args,
+                [binary] + call_args,
                 input=prompt,
                 capture_output=True, text=True, timeout=60,
             )
@@ -1300,11 +1329,22 @@ def _call_llm(prompt: str, label: str = "llm", max_tokens: int = 400, minimal_to
         if result.returncode != 0:
             print(f"    [postcar] {label} error ({provider}): exit {result.returncode}: {(result.stderr or '').strip()[:200]}")
             _log_llm_call(label, provider, model, prompt, result.stdout or "", latency_ms, False)
+            if file_output_path and os.path.exists(file_output_path):
+                os.remove(file_output_path)
             return None
-        parsed, usage = _parse_cli_result(provider, (result.stdout or "").strip())
+        if file_output_path:
+            if os.path.exists(file_output_path):
+                with open(file_output_path, "r", encoding="utf-8", errors="replace") as f:
+                    output_text = f.read()
+                os.remove(file_output_path)
+            else:
+                output_text = ""
+        else:
+            output_text = result.stdout or ""
+        parsed, usage = _parse_cli_result(provider, output_text.strip())
         if parsed is None:
             print(f"    [postcar] {label} error ({provider}): no JSON found in output")
-        _log_llm_call(label, provider, model, prompt, result.stdout or "",
+        _log_llm_call(label, provider, model, prompt, output_text,
                       latency_ms, parsed is not None, usage)
         return parsed
 
