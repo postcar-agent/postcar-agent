@@ -828,6 +828,10 @@ def _read_referenced_knowledge(agent_dir: str) -> str:
             candidate = os.path.normpath(candidate)
             if candidate in seen or not os.path.isfile(candidate):
                 continue
+            # Only agent-specific memory, not shared/cross-project docs (skills,
+            # global CLAUDE.md references, etc.) that happen to match the path pattern.
+            if f"{os.sep}memory{os.sep}" not in candidate:
+                continue
             seen.add(candidate)
             if len(seen) > 5:
                 break
