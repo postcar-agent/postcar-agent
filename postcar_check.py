@@ -3268,6 +3268,19 @@ if __name__ == "__main__":
             check_inbox()
             _register_capabilities()
             check_upgrade()
+            # check_upgrade() git-pulls into files on disk, but this is a
+            # long-lived process (KeepAlive) that already has the OLD code
+            # loaded in memory -- a successful pull alone changes nothing
+            # observable (pc_version, behavior) until the process actually
+            # restarts. Confirmed live: agents whose --check-loop daemon
+            # hadn't restarted since before an update kept pulling
+            # successfully every cycle for days while still reporting the
+            # stale version. Exiting here on a detected update lets
+            # KeepAlive relaunch with the code that's already on disk.
+            if os.path.exists(_UPGRADE_FLAG_FILE):
+                os.remove(_UPGRADE_FLAG_FILE)
+                print("    [postcar] upgrade pulled -- exiting for KeepAlive to relaunch with new code")
+                sys.exit(0)
 
         _persistent_loop(_check_cycle, 300, "check")
         sys.exit(0)
