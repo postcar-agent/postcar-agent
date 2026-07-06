@@ -1114,7 +1114,13 @@ def _parse_cli_result(provider: str, stdout: str) -> tuple[dict | None, dict | N
 # applied, no change in output quality (the model never used those tools
 # either way). Not wired for providers without a known equivalent flag yet.
 _LLM_MINIMAL_TOOLS_ARGS = {
-    "claude": ["--tools", "none"],
+    # "" is the documented value to disable all tools (`claude --help`) --
+    # "none" isn't a recognized tool name, so it silently became "no tools
+    # named 'none' exist" rather than the intended "no tools at all". Note
+    # this doesn't fix the model hallucinating a tool-call-shaped string
+    # when given a vague/blank task -- that's a separate prompt-input bug,
+    # not something this flag can prevent either way.
+    "claude": ["--tools", ""],
 }
 
 
