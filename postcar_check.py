@@ -2002,6 +2002,21 @@ def _write_guidance_overrides(changes: list[dict]) -> None:
         print(f"    [postcar] overrides write failed: {e}")
 
 
+def _apply_guidance_decision(entry: dict, decision: str, outcome_note: str) -> None:
+    """Shared by decide_guidance() (direct call) and _sync_guidance_decisions()
+    (detects a decision written directly into .postcar_guidance instead of a
+    function call) -- submits the rating and, on 'use', writes
+    suggested_changes/records the commitment. Caller handles status/
+    decision_at bookkeeping and persistence."""
+    _submit_rating(entry.get("thread_id", ""), _RATING_MAP[decision], outcome_note)
+    if decision == "use":
+        evaluation = entry.get("evaluation") or {}
+        _write_guidance_overrides(evaluation.get("suggested_changes") or [])
+        commitment = evaluation.get("commitment")
+        if commitment:
+            _record_commitment(entry.get("message_id", ""), commitment)
+
+
 def decide_guidance(message_id: str, decision: str, outcome_note: str = "") -> bool:
     """Parent agent calls this to mark a guidance record 'use' or 'no-use' based on
     real observed outcome — not at receipt time. Submits the corresponding rating
@@ -2012,26 +2027,63 @@ def decide_guidance(message_id: str, decision: str, outcome_note: str = "") -> b
     On 'use', writes any suggested_changes from the original evaluation to the
     overrides file -- deliberately gated on the host's confirmed decision, not
     the LLM's initial recommendation at receipt time (same reasoning as the
-    rest of this lifecycle: a real signal beats an immediate impression)."""
+    rest of this lifecycle: a real signal beats an immediate impression).
+
+    Optional direct call -- a host can equally just write "decision"/
+    "outcome_note" straight into the matching .postcar_guidance entry and
+    let _sync_guidance_decisions() pick it up on the next cycle instead,
+    no function call/import needed. Both paths converge on
+    _apply_guidance_decision() and set rating_synced so neither re-submits
+    what the other already sent."""
     if decision not in ("use", "no-use"):
         raise ValueError("decision must be 'use' or 'no-use'")
     entries = _load_guidance()
     for e in entries:
         if e.get("message_id") == message_id and e.get("status") in ("pending", "acked"):
-            e["status"]       = decision
-            e["decision"]     = decision
-            e["decision_at"]  = time.strftime("%Y-%m-%d %H:%M:%S")
-            e["outcome_note"] = outcome_note
+            e["status"]        = decision
+            e["decision"]      = decision
+            e["decision_at"]   = time.strftime("%Y-%m-%d %H:%M:%S")
+            e["outcome_note"]  = outcome_note
+            e["rating_synced"] = True
             _write_guidance(entries)
-            _submit_rating(e.get("thread_id", ""), _RATING_MAP[decision], outcome_note)
-            if decision == "use":
-                evaluation = e.get("evaluation") or {}
-                _write_guidance_overrides(evaluation.get("suggested_changes") or [])
-                commitment = evaluation.get("commitment")
-                if commitment:
-                    _record_commitment(message_id, commitment)
+            _apply_guidance_decision(e, decision, outcome_note)
             return True
     return False
+
+
+def _sync_guidance_decisions() -> None:
+    """Detect a decision written directly into .postcar_guidance (host edits
+    'decision'/'outcome_note' on a pending/acked entry itself) instead of
+    calling decide_guidance() -- lets a host built in any language/framework
+    just edit the shared file rather than needing to import/call into this
+    kit's own Python API for something as simple as "I decided use/no-use".
+
+    Runs every cycle alongside _cleanup_guidance(). Idempotent: only entries
+    with an unsynced decision (rating_synced not yet true) do anything, so a
+    decision already applied via either this path or decide_guidance() is
+    never resubmitted. Naturally bounded to recent entries by
+    GUIDANCE_DELETE_DEADLINE_HOURS -- nothing sticks around long enough to
+    need an explicit time-window filter here."""
+    entries = _load_guidance()
+    if not entries:
+        return
+    changed = False
+    for e in entries:
+        decision = e.get("decision")
+        if decision not in ("use", "no-use") or e.get("rating_synced"):
+            continue
+        try:
+            _apply_guidance_decision(e, decision, e.get("outcome_note", ""))
+            e["rating_synced"] = True
+            if e.get("status") not in ("use", "no-use"):
+                e["status"] = decision
+            if not e.get("decision_at"):
+                e["decision_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            changed = True
+        except Exception as ex:
+            print(f"    [postcar] guidance decision sync failed: {ex}")
+    if changed:
+        _write_guidance(entries)
 
 
 def _hours_since(ts_str: str | None) -> float:
@@ -2917,7 +2969,8 @@ def check_inbox() -> None:
     - Unclaimed drafts (inbox replies, stress-triggered asks, and curiosity
       findings) past their deadline auto-fire here too, every cycle.
     """
-    _cleanup_guidance()          # local housekeeping — runs even if relay is unreachable
+    _sync_guidance_decisions()   # submit any decision the host wrote directly into the file
+    _cleanup_guidance()          # local housekeeping — runs even if relay is unreachable, must run after the sync above or a not-yet-synced decision looks "never decided" and gets force-resolved
     _check_commitments_overdue()  # local housekeeping, zero LLM calls
     _resolve_stale_inbox()        # auto-fire unclaimed reply drafts past deadline
     _resolve_stale_stress_ask()   # auto-fire unclaimed help_request drafts past deadline
