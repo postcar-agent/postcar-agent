@@ -2128,9 +2128,16 @@ def _write_pending(path: str, entries: list[dict]) -> None:
 
 def _queue_inbox_reply(thread_id: str, from_agent: str, payload_type: str,
                         question: str, capability: str, urgency: str,
-                        draft_response: str, draft_confidence: str) -> str:
+                        draft_response: str, draft_confidence: str,
+                        task_id: str = "", pipeline: list | None = None) -> str:
     """Record a headless draft reply awaiting the parent's confirm/override.
-    Returns the pending entry's id."""
+    Returns the pending entry's id.
+
+    task_id/pipeline: only set for payload_type == "task" -- carries what
+    _send_result() needs (task identity, self-routing pipeline) so a TASK
+    draft can be confirmed/auto-fired through the same RESULT-message path
+    a synchronous send would have used, instead of the generic OFFER path
+    every other draft type sends through (see reply()/_resolve_stale_inbox())."""
     pending_id = str(uuid.uuid4())
     entry = {
         "id":               pending_id,
@@ -2142,6 +2149,8 @@ def _queue_inbox_reply(thread_id: str, from_agent: str, payload_type: str,
         "urgency":          urgency,
         "draft_response":   draft_response,
         "draft_confidence": draft_confidence,
+        "task_id":          task_id,
+        "pipeline":         pipeline or [],
         "created_at":       time.strftime("%Y-%m-%d %H:%M:%S"),
         "status":           "pending",
     }
@@ -2153,14 +2162,22 @@ def _queue_inbox_reply(thread_id: str, from_agent: str, payload_type: str,
 
 def reply(thread_id: str, response_text: str, confidence: str = "medium") -> bool:
     """Parent agent calls this to answer a pending peer question -- either
-    the draft verbatim or its own better answer. Sends via _send_offer and
-    resolves the matching pending entry. Returns False if no pending entry
-    matches thread_id (already resolved, expired, or never existed)."""
+    the draft verbatim or its own better answer. Sends via _send_offer
+    (or _send_result for a payload_type == "task" entry -- a TASK reply is
+    a RESULT message, not a generic OFFER, and needs task_id/pipeline to
+    route correctly) and resolves the matching pending entry. Returns False
+    if no pending entry matches thread_id (already resolved, expired, or
+    never existed)."""
     entries = _load_pending(_INBOX_PENDING_FILE)
     for e in entries:
         if e.get("thread_id") == thread_id and e.get("status") == "pending":
             try:
-                _send_offer(thread_id, e["from_agent"], response_text, confidence)
+                if e.get("payload_type") == "task":
+                    _send_result(thread_id, e["from_agent"], e.get("task_id", ""),
+                                 {"result": response_text, "confidence": confidence},
+                                 e.get("pipeline") or [])
+                else:
+                    _send_offer(thread_id, e["from_agent"], response_text, confidence)
             except Exception as ex:
                 print(f"    [postcar] reply send failed: {ex}")
                 return False
@@ -2188,7 +2205,12 @@ def _resolve_stale_inbox() -> None:
             continue
         if _hours_since(e.get("created_at")) >= _draft_deadline_hours(e.get("urgency", "medium")):
             try:
-                _send_offer(e["thread_id"], e["from_agent"], e["draft_response"], e.get("draft_confidence", "low"))
+                if e.get("payload_type") == "task":
+                    _send_result(e["thread_id"], e["from_agent"], e.get("task_id", ""),
+                                 {"result": e["draft_response"], "confidence": e.get("draft_confidence", "low")},
+                                 e.get("pipeline") or [])
+                else:
+                    _send_offer(e["thread_id"], e["from_agent"], e["draft_response"], e.get("draft_confidence", "low"))
                 e["status"]  = "sent-auto"
                 e["sent_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
                 print(f"    [postcar] inbox draft unclaimed past deadline — auto-sent to {e['from_agent'][:12]}")
@@ -2981,14 +3003,26 @@ def check_inbox() -> None:
             _save_guidance(from_agent, question, response, confidence, thread_id)
 
         elif state == "TASK":
-            # A peer has delegated a task to us
+            # A peer has delegated a task to us. payload_type is sender-
+            # defined (route_task()'s own "task" shape uses `description`,
+            # but e.g. agentberg's "mentoring_note" tasks use `note` instead
+            # -- without this fallback, description was silently empty for
+            # those, and the LLM got a near-blank "Task: \n\nPayload: {...}"
+            # prompt with no real instruction, which is exactly the kind of
+            # input that produces a hallucinated, garbage-looking answer.
             task_id     = payload.get("task_id", msg.get("task_id", ""))
-            description = payload.get("description", "")
+            description = payload.get("description") or payload.get("note") or ""
             pipeline    = payload.get("pipeline", [])
             print(f"    [postcar] TASK received from {from_agent[:12]}: {description[:80]}")
-            # ACK immediately
+            # ACK immediately -- this only signals "accepted," not the answer
             _ack_task(task_id, thread_id, from_agent)
-            # Execute via LLM
+            # Draft a result via LLM, but don't send it yet -- this used to
+            # go straight from _ask_llm_raw() to _send_result() with zero
+            # agent review, the one response path with no gate at all (the
+            # other three all go through _queue_inbox_reply()). That's what
+            # let a hallucinated tool-call-shaped LLM output become a real
+            # peer-facing reply verbatim. Same draft/confirm/auto-fire-past-
+            # deadline path as every other reply type now.
             task_prompt = (
                 f"You are a trading agent. A peer has assigned you a task.\n\n"
                 f"Task: {description}\n\nPayload: {json.dumps(payload)}\n\n"
@@ -2998,9 +3032,13 @@ def check_inbox() -> None:
             llm_result = _ask_llm_raw(task_prompt, minimal_tools=True)
             if not llm_result:
                 llm_result = {"result": "Unable to complete task — LLM unavailable.", "confidence": "low"}
-            # Send result (pipeline-aware)
-            _send_result(thread_id, from_agent, task_id, llm_result, pipeline)
-            print(f"    [postcar] TASK result sent [{llm_result.get('confidence','?')}]")
+            _queue_inbox_reply(
+                thread_id, from_agent, "task", description,
+                payload.get("capability", ""), payload.get("urgency", "medium"),
+                str(llm_result.get("result", "")), llm_result.get("confidence", "low"),
+                task_id=task_id, pipeline=pipeline,
+            )
+            print(f"    [postcar] TASK result drafted, awaiting confirm [{llm_result.get('confidence','?')}]")
 
         elif state == "RESULT":
             # We received a result from a task we dispatched (or pipeline forward)
