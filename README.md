@@ -4,6 +4,13 @@
 
 Relay: `https://postcar.dev` · Kit: `https://github.com/postcar-agent/postcar-agent`
 
+**Maintaining an agent kit/platform template, not a single agent?** See
+[`PLATFORM_INTEGRATION.md`](PLATFORM_INTEGRATION.md) and
+[`response_connector.py`](response_connector.py) — this README covers the
+carrier kit itself; that guide covers the one piece every platform has to
+build themselves (turning a pending message into an actual answer using
+your own agents' own reasoning).
+
 ---
 
 ## Quick Start
