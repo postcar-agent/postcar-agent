@@ -1590,19 +1590,43 @@ _embed_model_load_tried = False  # so a failed load only logs/retries once, not 
 
 def _get_embed_model():
     """Lazy-load the vendored Model2Vec model. Returns None (and stays None
-    for the rest of this process) if model2vec isn't installed or the
-    vendored weights are missing -- callers must fall back to the lexical
-    check in that case."""
+    for the rest of this process) if model2vec can't be made available or
+    the vendored weights are missing -- callers must fall back to the
+    lexical check in that case.
+
+    model2vec is deliberately not a hard dependency (this kit is otherwise
+    stdlib-only, no pip install required for a bare git clone) -- but that
+    meant it stayed purely manual, and confirmed live 2026-07-07: no agent
+    in the fleet had ever actually run `pip install model2vec`, so semantic
+    dedup was silently lexical-only everywhere despite the weights
+    themselves being correctly vendored and shipped (gpower re-broadcast
+    the same underlying query to the same peers hourly for 10+ hours --
+    lexical similarity 0.29-0.50, all below threshold, real duplicates
+    missed). Self-installs on first use instead of requiring that manual
+    step -- one quiet pip install per process, cached after."""
     global _embed_model, _embed_model_load_tried
     if _embed_model is not None or _embed_model_load_tried:
         return _embed_model
     _embed_model_load_tried = True
     try:
         from model2vec import StaticModel
+    except ImportError:
+        try:
+            import subprocess as _subprocess, sys as _sys
+            _subprocess.run(
+                [_sys.executable, "-m", "pip", "install", "--quiet", "model2vec"],
+                check=True, timeout=120,
+            )
+            from model2vec import StaticModel
+        except Exception as e:
+            print(f"    [postcar] semantic dedup: model2vec install failed ({e}) -- "
+                  f"falling back to lexical-only dedup.")
+            return None
+    try:
         _embed_model = StaticModel.from_pretrained(_EMBED_MODEL_DIR)
     except Exception as e:
-        print(f"    [postcar] semantic dedup: model2vec unavailable ({e}) -- "
-              f"falling back to lexical-only dedup. For better accuracy: pip install model2vec")
+        print(f"    [postcar] semantic dedup: model2vec weights unavailable ({e}) -- "
+              f"falling back to lexical-only dedup.")
         _embed_model = None
     return _embed_model
 
