@@ -920,53 +920,6 @@ def _build_context() -> str:
     return "\n\n".join(parts) if parts else "no agent context available"
 
 
-_STORE_SPEC_CACHE = os.path.join(_DIR, ".postcar_store_spec.json")
-
-
-def _discover_store_spec() -> dict:
-    """Read .postcar.yaml from the agent directory (or parent dir).
-
-    PostCar owns this file — it is never written to the parent agent's CLAUDE.md.
-    Falls back to .postcar_store_spec.json cache if .postcar.yaml is absent.
-    """
-    # Return cached if fresh (< 1 hour) and no .postcar.yaml exists to supersede it
-    yaml_candidates = [
-        os.path.join(_DIR, ".postcar.yaml"),
-        os.path.join(os.path.dirname(_DIR), ".postcar.yaml"),
-    ]
-    yaml_path = next((p for p in yaml_candidates if os.path.exists(p)), None)
-
-    if not yaml_path and os.path.exists(_STORE_SPEC_CACHE):
-        try:
-            age = time.time() - os.path.getmtime(_STORE_SPEC_CACHE)
-            if age < 3600:
-                return json.loads(open(_STORE_SPEC_CACHE).read())
-        except Exception:
-            pass
-
-    spec: dict = {}
-    if yaml_path:
-        try:
-            import re
-            content = open(yaml_path).read()
-            # Simple key: value parser (no PyYAML dependency — stdlib only)
-            ds_m = re.search(r"data_store\s*:\s*\n((?:\s{2}.+\n?)*)", content)
-            if ds_m:
-                for line in ds_m.group(1).splitlines():
-                    m = re.match(r"\s+(\w+)\s*:\s*\"?(.+?)\"?\s*$", line)
-                    if m:
-                        spec[m.group(1)] = m.group(2).strip()
-        except Exception:
-            pass
-
-    try:
-        with open(_STORE_SPEC_CACHE, "w") as f:
-            json.dump(spec, f, indent=2)
-    except Exception:
-        pass
-    return spec
-
-
 # ── LLM dispatch ──────────────────────────────────────────────────────────────
 # PostCar calls exactly the LLM the parent agent itself uses — no fallback
 # cascade across other tools. A cascade silently shifts cost onto whatever
