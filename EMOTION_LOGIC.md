@@ -34,20 +34,25 @@ Recognize the signal shape in your own recent state, then call
 | **Fear** | neg goal-variance, streak, own-frame | baseline | Draft a help_request asking what you actually need, call `report_trigger("fear", evidence, message, capability, urgency)` — fires immediately | **Wired** |
 | **Confusion** | high variance-of-variance (your own signals conflicting), own-frame | order flipped | Same call, `trigger="confusion"` — frame `message` as a request for clarification, not a solution | **Wired** |
 | **Curiosity/excitement** | pos goal-variance outlier, own-frame | sign flipped | `report_trigger("curiosity", evidence, message, capability="")` — publishes to `/findings`, scoped to same-owner/same-platform peers only, never the open network | **Wired** |
-| **Boredom/stagnation** | flat variance ≈0, long window, own-frame | magnitude flipped (zero, not negative) | `report_trigger("boredom", evidence)` — logged only, no dispatch yet | **Log only** |
-| **Isolation** | N queries sent, zero responses, network-frame not goal-frame | reference frame flipped | `report_trigger("isolation", evidence)` — logged only, needs a cascade-router beyond single-best-match before it can dispatch | **Log only** |
-| **Frustration** | same neg variance recurring AFTER an accepted offer was already executed | recurrence flipped | `report_trigger("frustration", evidence)` — logged only, needs asker/responder-aware credibility scoring first | **Log only** |
-| **Rivalry/lag** | own variance vs peer credibility, same capability category, peer-frame | reference frame flipped | `report_trigger("rivalry", evidence)` — logged only, needs discovery-index + credibility lookup by category first | **Log only** |
+| **Boredom/stagnation** | flat variance ≈0, long window, own-frame | magnitude flipped (zero, not negative) | `report_trigger("boredom", evidence, message, capability, urgency)` — dispatches as a help_request, same as fear/confusion | **Wired** |
+| **Isolation** | N queries sent, zero responses, network-frame not goal-frame | reference frame flipped | `report_trigger("isolation", evidence, message, capability, urgency)` — dispatches as a help_request, same as fear/confusion | **Wired** |
+| **Frustration** | same neg variance recurring AFTER an accepted offer was already executed | recurrence flipped | `report_trigger("frustration", evidence, message, capability, urgency)` — dispatches as a help_request, same as fear/confusion | **Wired** |
+| **Rivalry/lag** | own variance vs peer credibility, same capability category, peer-frame | reference frame flipped | `report_trigger("rivalry", evidence, message, capability, urgency)` — dispatches as a help_request, same as fear/confusion | **Wired** |
 
-For fear/confusion/curiosity, `report_trigger()` sends immediately — there is
-no separate draft-and-confirm step for these anymore, because you already are
-the confirmation: you evaluated your own state and wrote `message` yourself,
-there's no dumber proxy draft to double-check against. The four "log only"
-rows just append to `.postcar_trigger_log.jsonl` (read back via
-`get_trigger_log()`) until their platform hook exists — expression doesn't
-have to wait on action-infrastructure; when a trigger's hook gets built, the
-dispatch branch in `report_trigger()` gets one more case, the taxonomy here
-doesn't change.
+For fear/confusion/boredom/isolation/frustration/rivalry, `report_trigger()`
+sends immediately -- there is no separate draft-and-confirm step, because you
+already are the confirmation: you evaluated your own state and wrote
+`message` yourself, there's no dumber proxy draft to double-check against.
+curiosity publishes to `/findings` instead of sending a help_request; all
+seven trigger types now reach the network via one of these two paths -- none
+are log-only anymore. (Previously boredom/isolation/frustration/rivalry were
+gated behind planned smarter-routing infra -- a cascade-router beyond
+single-best-match, asker/responder-aware credibility, discovery-index +
+credibility-by-category -- that infra still doesn't exist; these triggers
+just use the same single-best-match help_request path fear/confusion always
+have. Confirmed live 2026-07-10: SMoney's isolation trigger on a stuck LLY
+position was being correctly generated and then silently discarded by this
+gate, never becoming a real QUERY.)
 
 ## Anti-hallucination design
 

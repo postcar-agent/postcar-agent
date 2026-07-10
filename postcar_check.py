@@ -2395,17 +2395,16 @@ def report_trigger(trigger: str, evidence: str, message: str = "",
     observed, not a vibe adjective -- same anti-hallucination discipline as
     before, just applied by you instead of a proxy.
 
-    fear/confusion: message is the question to raise, capability required --
-      fires immediately, no confirm step (you already are the confirmation
-      by choosing to call this with your own drafted message).
+    fear/confusion/boredom/isolation/frustration/rivalry: message is the
+      question to raise, capability required -- fires immediately, no
+      confirm step (you already are the confirmation by choosing to call
+      this with your own drafted message).
     curiosity: message is the finding to share, capability optional --
       publishes immediately to /findings (owner/platform-scoped, never open
       network).
-    boredom/isolation/frustration/rivalry: no dispatch exists yet -- logged
-      to .postcar_trigger_log.jsonl for later, message/capability ignored.
 
     Returns True if something was actually sent/published, False if dropped
-    (dupe, missing evidence/message/capability, or a log-only trigger)."""
+    (dupe, missing evidence/message/capability)."""
     if trigger not in TRIGGER_TYPES or trigger == "none":
         return False
     if not evidence:
@@ -2420,9 +2419,6 @@ def report_trigger(trigger: str, evidence: str, message: str = "",
     except Exception:
         pass
 
-    if trigger not in ("fear", "confusion", "curiosity"):
-        print(f"    [postcar] trigger reported (no dispatch yet): {trigger} — {evidence[:80]}")
-        return False
     if not message:
         return False
 
