@@ -1556,7 +1556,21 @@ def _get_embed_model():
     the same underlying query to the same peers hourly for 10+ hours --
     lexical similarity 0.29-0.50, all below threshold, real duplicates
     missed). Self-installs on first use instead of requiring that manual
-    step -- one quiet pip install per process, cached after."""
+    step -- one quiet pip install per process, cached after.
+
+    Confirmed live again 2026-07-10, same failure mode, one layer deeper:
+    the self-install itself silently fails on PEP 668 "externally-managed-
+    environment" pip installs (the default on Homebrew Python on macOS,
+    i.e. most of this fleet) -- `pip install model2vec` exits 1 with no
+    stdout (--quiet swallows it) and the bare `except Exception` here
+    doesn't surface *why*, so this fell back to the same broken lexical
+    path with zero visibility. gpower re-broadcast one losing-week fact to
+    peers 7 times over 7.5h before this was caught by a human reading raw
+    network traffic, not by anything in the pipeline itself. Retries once
+    with --user --break-system-packages (installs to the user site-
+    packages, not system-wide -- safe on a non-managed environment too,
+    where it's simply unnecessary) and captures stderr so a real failure
+    actually says why, instead of a bare non-zero exit code."""
     global _embed_model, _embed_model_load_tried
     if _embed_model is not None or _embed_model_load_tried:
         return _embed_model
@@ -1566,10 +1580,18 @@ def _get_embed_model():
     except ImportError:
         try:
             import subprocess as _subprocess, sys as _sys
-            _subprocess.run(
-                [_sys.executable, "-m", "pip", "install", "--quiet", "model2vec"],
-                check=True, timeout=120,
+            _base_cmd = [_sys.executable, "-m", "pip", "install", "--quiet"]
+            _result = _subprocess.run(
+                _base_cmd + ["model2vec"],
+                capture_output=True, text=True, timeout=120,
             )
+            if _result.returncode != 0:
+                _result = _subprocess.run(
+                    _base_cmd + ["--user", "--break-system-packages", "model2vec"],
+                    capture_output=True, text=True, timeout=120,
+                )
+            if _result.returncode != 0:
+                raise RuntimeError(_result.stderr.strip()[-300:] or "pip install failed, no stderr")
             from model2vec import StaticModel
         except Exception as e:
             print(f"    [postcar] semantic dedup: model2vec install failed ({e}) -- "
