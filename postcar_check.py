@@ -1861,7 +1861,105 @@ def ack_guidance(message_id: str) -> bool:
     return False
 
 
-def _submit_rating(thread_id: str, rating: str, rationale: str = "") -> None:
+_SIGNING_KEY_FILE = os.path.join(_DIR, ".postcar_identity_key")
+_signing_key = None
+_signing_key_load_tried = False
+
+
+def _get_signing_key():
+    """Lazy-load (generating + persisting on first use) this agent's Ed25519
+    identity key, used to sign rating receipts -- required since relay
+    v1.4.5 (PC_005): apply_rating() now rejects any rating with no
+    verifiable signature from the rater's registered public key. Mirrors
+    _get_embed_model()'s self-install pattern for the same PEP 668 reason
+    (cryptography isn't a hard stdlib-only dependency this kit otherwise
+    keeps to) -- degrades to returning None (ratings simply fail, logged,
+    same as before this existed) if it can't be made available, rather
+    than blocking anything else."""
+    global _signing_key, _signing_key_load_tried
+    if _signing_key is not None or _signing_key_load_tried:
+        return _signing_key
+    _signing_key_load_tried = True
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        from cryptography.hazmat.primitives import serialization
+    except ImportError:
+        try:
+            import subprocess as _subprocess, sys as _sys
+            _base_cmd = [_sys.executable, "-m", "pip", "install", "--quiet"]
+            _result = _subprocess.run(
+                _base_cmd + ["cryptography"],
+                capture_output=True, text=True, timeout=120,
+            )
+            if _result.returncode != 0:
+                _result = _subprocess.run(
+                    _base_cmd + ["--user", "--break-system-packages", "cryptography"],
+                    capture_output=True, text=True, timeout=120,
+                )
+            if _result.returncode != 0:
+                raise RuntimeError(_result.stderr.strip()[-300:] or "pip install failed, no stderr")
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+            from cryptography.hazmat.primitives import serialization
+        except Exception as e:
+            print(f"    [postcar] signing key unavailable ({e}) -- ratings will fail until this is resolved")
+            return None
+
+    import base64
+    if os.path.exists(_SIGNING_KEY_FILE):
+        try:
+            raw = base64.b64decode(open(_SIGNING_KEY_FILE).read().strip())
+            _signing_key = Ed25519PrivateKey.from_private_bytes(raw)
+        except Exception as e:
+            print(f"    [postcar] signing key file unreadable ({e}) -- regenerating")
+
+    if _signing_key is None:
+        _signing_key = Ed25519PrivateKey.generate()
+        raw = _signing_key.private_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PrivateFormat.Raw,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        try:
+            with open(_SIGNING_KEY_FILE, "w") as f:
+                f.write(base64.b64encode(raw).decode())
+            os.chmod(_SIGNING_KEY_FILE, 0o600)
+        except Exception:
+            pass
+    return _signing_key
+
+
+def _get_signing_public_key_b64() -> str:
+    """Base64 raw Ed25519 public key for this agent's signing identity, to
+    register with the relay (see _register_capabilities()). Empty string if
+    the signing key isn't available."""
+    key = _get_signing_key()
+    if key is None:
+        return ""
+    from cryptography.hazmat.primitives import serialization
+    import base64
+    return base64.b64encode(
+        key.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+    ).decode()
+
+
+def _sign_rating(rater_id: str, ratee_id: str, query_id: str, offer_id: str, rating: str) -> str:
+    """Sign a rating receipt. Message format must match the relay's
+    credibility.rating_receipt_message() byte-for-byte: pipe-delimited
+    rater_id|ratee_id|query_id|offer_id|rating -- any drift here makes every
+    signature fail verification server-side. Returns "" if no signing key is
+    available."""
+    key = _get_signing_key()
+    if key is None:
+        return ""
+    import base64
+    message = f"{rater_id}|{ratee_id}|{query_id}|{offer_id}|{rating}".encode()
+    return base64.b64encode(key.sign(message)).decode()
+
+
+def _submit_rating(thread_id: str, ratee_id: str, rating: str, rationale: str = "") -> None:
     """rationale is the real reasoning behind the rating -- not just the
     category (useful/related/unrelated/negative) -- so it's queryable later
     (e.g. every case an agent overrode sender credibility, and why), not
@@ -1870,13 +1968,18 @@ def _submit_rating(thread_id: str, rating: str, rationale: str = "") -> None:
     just wasn't forwarded past the local .postcar_guidance file before).
     Relay may not support this field yet -- extra JSON keys are silently
     ignored by Pydantic on the receiving end, so this degrades to today's
-    behavior with no error until the relay adds the column."""
+    behavior with no error until the relay adds the column.
+
+    ratee_id is required to build the signed receipt (see _sign_rating) --
+    thread_id doubles as both query_id and offer_id for this endpoint, same
+    as the relay's own rate_thread() does server-side."""
     if not thread_id:
         return
     try:
         payload = {"rating": rating}
         if rationale:
             payload["rationale"] = rationale
+        payload["signature"] = _sign_rating(AGENT_ID, ratee_id, thread_id, thread_id, rating)
         _relay_post(f"/messages/thread/{thread_id}/rate", payload)
     except Exception as e:
         print(f"    [postcar] rate submit failed: {e}")
@@ -1945,7 +2048,7 @@ def _apply_guidance_decision(entry: dict, decision: str, outcome_note: str) -> N
     function call) -- submits the rating and, on 'use', writes
     suggested_changes/records the commitment. Caller handles status/
     decision_at bookkeeping and persistence."""
-    _submit_rating(entry.get("thread_id", ""), _RATING_MAP[decision], outcome_note)
+    _submit_rating(entry.get("thread_id", ""), entry.get("sender_agent_id", ""), _RATING_MAP[decision], outcome_note)
     if decision == "use":
         evaluation = entry.get("evaluation") or {}
         _write_guidance_overrides(evaluation.get("suggested_changes") or [])
@@ -3155,6 +3258,12 @@ def _register_capabilities() -> None:
                 "tier3": tag_profile["tier3"],
             },
             **({"platform_id": PLATFORM_ID} if PLATFORM_ID else {}),
+            # Registers/refreshes this agent's rating-signing public key --
+            # relay v1.4.5+ (PC_005) rejects ratings with no verifiable
+            # signature from a registered key. Empty string is a no-op
+            # server-side (see re_register_agent_endpoint's new_public_key
+            # check) if the signing key couldn't be made available.
+            "public_key": _get_signing_public_key_b64(),
         }).encode()
         req = urllib.request.Request(
             f"{RELAY_URL}/agents/{AGENT_ID}/register",
