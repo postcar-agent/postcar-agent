@@ -1392,7 +1392,8 @@ def _scrub_pii(obj):
 
 # ── Relay call ────────────────────────────────────────────────────────────────
 
-def _post_help_request(question: str, capability: str, urgency: str) -> None:
+def _post_help_request(question: str, capability: str, urgency: str) -> bool:
+    """Returns True only if the relay actually delivered to >=1 peer."""
     try:
         import urllib.request
         payload = json.dumps(_scrub_pii({
@@ -1416,8 +1417,10 @@ def _post_help_request(question: str, capability: str, urgency: str) -> None:
             result = json.loads(r.read())
         delivered = result.get("count", 0)
         print(f"    [postcar] help_request → {delivered} peer(s) [{capability} / {urgency}]")
+        return delivered > 0
     except Exception as e:
         print(f"    [postcar] relay error: {e}")
+        return False
 
 
 def _send_direct_message(to_agent: str, text: str, thread_id: str = "") -> None:
@@ -1671,6 +1674,7 @@ def _relay_get(path: str) -> dict:
 
 
 def _relay_post(path: str, payload: dict) -> dict:
+    import urllib.error
     import urllib.request
     data = json.dumps(_scrub_pii(payload)).encode()
     req = urllib.request.Request(
@@ -1683,8 +1687,20 @@ def _relay_post(path: str, payload: dict) -> dict:
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=10) as r:
-        return json.loads(r.read())
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        # Surface the relay's actual detail (e.g. "sender already has 10
+        # messages in this thread" for a 429 turn-limit) instead of the
+        # bare "HTTP Error 429: Too Many Requests" str(e) gives -- that's a
+        # permanent per-thread cap, not a transient rate limit, and callers
+        # need the real reason to know retrying this thread won't help.
+        try:
+            detail = json.loads(e.read()).get("detail", e.reason)
+        except Exception:
+            detail = e.reason
+        raise RuntimeError(f"HTTP {e.code}: {detail}") from e
 
 
 def _send_offer(thread_id: str, to_agent: str, response: str, confidence: str) -> None:
@@ -2538,8 +2554,7 @@ def report_trigger(trigger: str, evidence: str, message: str = "",
         print("    [postcar] semantic dupe: similar question asked in last 24h — skipping")
         return False
     _record_asked_question(message, capability)
-    _post_help_request(message, capability, urgency)
-    return True
+    return _post_help_request(message, capability, urgency)
 
 
 # ── Commitments (prose promises made when acting on guidance) ────────────────
@@ -3151,6 +3166,13 @@ def check_inbox() -> None:
             # Forward along pipeline if non-empty
             if pipeline:
                 _send_result(thread_id, from_agent, task_id, result_obj, pipeline)
+
+        else:
+            # Unrecognized state/payload_type combo -- drained from the relay's
+            # inbox above, so it's gone either way; at minimum log it instead
+            # of dropping silently (was: no branch, no log, message vanishes).
+            print(f"    [postcar] inbox: unhandled state={state!r} "
+                  f"payload_type={msg.get('payload_type')!r} from {from_agent[:12]} -- dropped")
 
 
 # ── Self-upgrade ──────────────────────────────────────────────────────────────
